@@ -1,13 +1,19 @@
 import { StatusBar } from 'expo-status-bar';
-import { useState } from 'react';
+import * as Crypto from 'expo-crypto';
+import { useEffect, useState } from 'react';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import {
-  Modal, Pressable, ScrollView, StyleSheet, Text, View,
+  ActivityIndicator, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View,
 } from 'react-native';
+import {
+  Account, ApiError, completePasswordReset, createAccount, requestEmailVerification, requestPasswordReset,
+  restoreActiveAccount, signIn, signOut, verifyEmail,
+} from './auth';
+import { fetchRewards, redeemReward as submitRewardRedemption, Reward } from './rewardsApi';
 
 type Tab = 'Events' | 'Menu' | 'Rewards';
 type Category = 'All' | 'Food' | 'Drinks';
-type Reward = { id: string; name: string; points: number; icon: string };
+type AuthMode = 'login' | 'signup' | 'verify' | 'forgot' | 'reset';
 
 const tabs: { name: Tab; icon: string }[] = [
   { name: 'Events', icon: '◷' },
@@ -30,24 +36,363 @@ const menu = [
   { id: 'matcha', name: 'Iced matcha', description: 'Smooth matcha, oat milk & a touch of vanilla.', price: '$5.50', category: 'Drinks', icon: '🍵' },
   { id: 'lemonade', name: 'Fresh lemonade', description: 'Fresh-squeezed lemons. A sunny little pick-me-up.', price: '$4.50', category: 'Drinks', icon: '🍋' },
 ];
-const rewards: Reward[] = [
-  { id: 'coffee', name: 'A coffee on us', points: 100, icon: '☕' },
-  { id: 'pastry', name: 'Your favorite pastry', points: 150, icon: '🥐' },
-  { id: 'lunch', name: 'Lunch, with love', points: 250, icon: '🥗' },
-];
-
 export default function App() {
   return <SafeAreaProvider><LoyaltyApp /></SafeAreaProvider>;
 }
 
 function LoyaltyApp() {
+  const [account, setAccount] = useState<Account | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [startupError, setStartupError] = useState('');
+
+  async function loadAccount() {
+    setLoading(true);
+    setStartupError('');
+    try {
+      setAccount(await restoreActiveAccount());
+    } catch (error) {
+      console.error('Unable to restore the API session.', error);
+      setStartupError('We could not connect to your account. Check your connection and try again.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadAccount();
+  }, []);
+
+  if (loading) {
+    return <LoadingScreen message="Connecting to Green Fork..." />;
+  }
+
+  if (startupError !== '') {
+    return <StartupErrorScreen message={startupError} onRetry={() => void loadAccount()} />;
+  }
+
+  if (!account) {
+    return <AuthScreen onAuthenticated={setAccount} />;
+  }
+
+  return (
+    <MemberApp
+      account={account}
+      onSignOut={async () => {
+        await signOut();
+        setAccount(null);
+      }}
+    />
+  );
+}
+
+function LoadingScreen({ message }: { message: string }) {
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <View style={styles.authCentered}>
+        <ActivityIndicator size="large" color="#234D38" />
+        <Text style={styles.authSubtitle}>{message}</Text>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function StartupErrorScreen({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <View style={styles.authCentered}>
+        <Text accessibilityRole="header" style={styles.authTitle}>We hit a snag.</Text>
+        <Text style={styles.authSubtitle}>{message}</Text>
+        <Pressable accessibilityRole="button" onPress={onRetry} style={styles.button}>
+          <Text style={styles.buttonText}>Try again</Text>
+        </Pressable>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) => void }) {
+  const [mode, setMode] = useState<AuthMode>('login');
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [code, setCode] = useState('');
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [pending, setPending] = useState(false);
+
+  async function submit() {
+    const normalizedEmail = email.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      setError('Enter a valid email address.');
+      return;
+    }
+    if (mode === 'signup' && name.trim() === '') {
+      setError('Enter your name to create an account.');
+      return;
+    }
+    if ((mode === 'signup' || mode === 'login' || mode === 'reset') && (password.length < 8 || password.length > 128)) {
+      setError('Use a password between 8 and 128 characters.');
+      return;
+    }
+    if ((mode === 'verify' || mode === 'reset') && !/^\d{8}$/.test(code.trim())) {
+      setError('Enter the 8-digit code from your email.');
+      return;
+    }
+
+    setPending(true);
+    setError('');
+    setNotice('');
+    try {
+      switch (mode) {
+        case 'signup':
+          await createAccount(name.trim(), normalizedEmail, password);
+          setMode('verify');
+          setNotice('If this address can be registered, a verification code has been sent.');
+          break;
+        case 'verify':
+          await verifyEmail(normalizedEmail, code.trim());
+          setMode('login');
+          setCode('');
+          setNotice('Email verified. You can now sign in.');
+          break;
+        case 'login':
+          onAuthenticated(await signIn(normalizedEmail, password));
+          break;
+        case 'forgot':
+          await requestPasswordReset(normalizedEmail);
+          setMode('reset');
+          setNotice('If an eligible account exists, a password reset code has been sent.');
+          break;
+        case 'reset':
+          await completePasswordReset(normalizedEmail, code.trim(), password);
+          setMode('login');
+          setCode('');
+          setPassword('');
+          setNotice('Your password has been reset. Sign in with the new password.');
+          break;
+      }
+    } catch (caughtError) {
+      if (caughtError instanceof ApiError) {
+        if (caughtError.code === 'email_verification_required') setMode('verify');
+        setError(caughtError.message);
+      } else {
+        console.error('Unable to complete account authentication.', caughtError);
+        setError('We could not complete that request. Please try again.');
+      }
+    } finally {
+      setPending(false);
+    }
+  }
+
+  function changeMode(nextMode: AuthMode) {
+    setMode(nextMode);
+    setError('');
+    setNotice('');
+  }
+
+  async function resendVerificationCode() {
+    setPending(true);
+    setError('');
+    setNotice('');
+    try {
+      await requestEmailVerification(email.trim());
+      setNotice('If this account needs verification, a code has been sent.');
+    } catch (caughtError) {
+      if (caughtError instanceof ApiError) setError(caughtError.message);
+      else {
+        console.error('Unable to request an email verification code.', caughtError);
+        setError('We could not send a code. Please try again.');
+      }
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar style="dark" />
+      <KeyboardAvoidingView style={styles.authKeyboard} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <ScrollView contentContainerStyle={styles.authScroll} keyboardShouldPersistTaps="handled">
+          <View style={styles.authShell}>
+            <View style={styles.brand}>
+              <View style={styles.logo}><Text style={styles.logoText}>g.</Text></View>
+              <View>
+                <Text style={styles.brandName}>green fork</Text>
+                <Text style={styles.brandCaption}>GOOD FOOD. LITTLE PERKS.</Text>
+              </View>
+            </View>
+            <Text style={styles.authEyebrow}>YOUR NEIGHBORHOOD, REWARDED</Text>
+            <Text accessibilityRole="header" style={styles.authTitle}>
+              {mode === 'login' ? 'Welcome back.'
+                : mode === 'signup' ? 'Make yourself at home.'
+                  : mode === 'verify' ? 'Check your inbox.'
+                    : mode === 'forgot' ? 'Reset your password.'
+                      : 'Choose a new password.'}
+            </Text>
+            <Text style={styles.authSubtitle}>
+              {mode === 'login' ? 'Sign in to pick up where the good stuff begins.'
+                : mode === 'signup' ? 'Create an account to join the Green Fork community.'
+                  : mode === 'verify' ? 'Enter the verification code sent to your email address.'
+                    : mode === 'forgot' ? 'We’ll email you a code if the account is eligible for a reset.'
+                      : 'Enter the code from your email and choose a new password.'}
+            </Text>
+
+            <View style={styles.authCard}>
+              {mode === 'signup' && (
+                <View style={styles.fieldGroup}>
+                  <Text style={styles.fieldLabel}>Name</Text>
+                  <TextInput
+                    accessibilityLabel="Name"
+                    autoCapitalize="words"
+                    autoComplete="name"
+                    onChangeText={setName}
+                    placeholder="Your name"
+                    returnKeyType="next"
+                    style={styles.textInput}
+                    value={name}
+                  />
+                </View>
+              )}
+              <View style={styles.fieldGroup}>
+                <Text style={styles.fieldLabel}>Email</Text>
+                <TextInput
+                  accessibilityLabel="Email"
+                  autoCapitalize="none"
+                  autoComplete="email"
+                  keyboardType="email-address"
+                  onChangeText={setEmail}
+                  placeholder="you@example.com"
+                  returnKeyType="next"
+                  style={styles.textInput}
+                  textContentType="emailAddress"
+                  value={email}
+                />
+              </View>
+              {(mode === 'verify' || mode === 'reset') && (
+                <View style={styles.fieldGroup}>
+                  <Text style={styles.fieldLabel}>Email code</Text>
+                  <TextInput
+                    accessibilityLabel="Email code"
+                    autoCapitalize="none"
+                    keyboardType="number-pad"
+                    maxLength={8}
+                    onChangeText={setCode}
+                    placeholder="8-digit code"
+                    style={styles.textInput}
+                    textContentType="oneTimeCode"
+                    value={code}
+                  />
+                </View>
+              )}
+              {(mode === 'login' || mode === 'signup' || mode === 'reset') && (
+                <View style={styles.fieldGroup}>
+                  <Text style={styles.fieldLabel}>{mode === 'reset' ? 'New password' : 'Password'}</Text>
+                  <TextInput
+                    accessibilityLabel={mode === 'reset' ? 'New password' : 'Password'}
+                    autoCapitalize="none"
+                    autoComplete={mode === 'signup' || mode === 'reset' ? 'new-password' : 'current-password'}
+                    onChangeText={setPassword}
+                    onSubmitEditing={() => void submit()}
+                    placeholder={mode === 'login' ? 'Your password' : '8–128 characters'}
+                    returnKeyType="go"
+                    secureTextEntry
+                    style={styles.textInput}
+                    textContentType={mode === 'signup' || mode === 'reset' ? 'newPassword' : 'password'}
+                    value={password}
+                  />
+                </View>
+              )}
+              {notice !== '' && <Text accessibilityLiveRegion="polite" style={styles.authNotice}>{notice}</Text>}
+              {error !== '' && <Text accessibilityLiveRegion="polite" style={styles.authError}>{error}</Text>}
+              <Pressable
+                accessibilityRole="button"
+                accessibilityState={{ disabled: pending }}
+                disabled={pending}
+                onPress={() => void submit()}
+                style={({ pressed }) => [styles.button, pending && styles.pendingButton, pressed && styles.pressed]}
+              >
+                {pending
+                  ? <ActivityIndicator color="#FFF" />
+                  : <Text style={styles.buttonText}>
+                    {mode === 'login' ? 'Sign in'
+                      : mode === 'signup' ? 'Create account'
+                        : mode === 'verify' ? 'Verify email'
+                          : mode === 'forgot' ? 'Send reset code'
+                            : 'Reset password'}
+                  </Text>}
+              </Pressable>
+              {mode === 'login' && (
+                <>
+                  <Pressable accessibilityRole="button" disabled={pending} onPress={() => changeMode('forgot')} style={styles.authSwitch}>
+                    <Text style={styles.authSwitchText}>Forgot your password?</Text>
+                  </Pressable>
+                  <Pressable accessibilityRole="button" disabled={pending} onPress={() => changeMode('verify')} style={styles.authSwitch}>
+                    <Text style={styles.authSwitchText}>Need a verification code?</Text>
+                  </Pressable>
+                  <Pressable accessibilityRole="button" disabled={pending} onPress={() => changeMode('signup')} style={styles.authSwitch}>
+                    <Text style={styles.authSwitchText}>New to Green Fork? Create an account</Text>
+                  </Pressable>
+                </>
+              )}
+              {mode === 'signup' && (
+                <Pressable accessibilityRole="button" disabled={pending} onPress={() => changeMode('login')} style={styles.authSwitch}>
+                  <Text style={styles.authSwitchText}>Already a member? Sign in</Text>
+                </Pressable>
+              )}
+              {mode === 'verify' && (
+                <>
+                  <Pressable accessibilityRole="button" disabled={pending} onPress={() => void resendVerificationCode()} style={styles.authSwitch}>
+                    <Text style={styles.authSwitchText}>Resend verification code</Text>
+                  </Pressable>
+                  <Pressable accessibilityRole="button" disabled={pending} onPress={() => changeMode('login')} style={styles.authSwitch}>
+                    <Text style={styles.authSwitchText}>Back to sign in</Text>
+                  </Pressable>
+                </>
+              )}
+              {(mode === 'forgot' || mode === 'reset') && (
+                <Pressable accessibilityRole="button" disabled={pending} onPress={() => changeMode(mode === 'reset' ? 'forgot' : 'login')} style={styles.authSwitch}>
+                  <Text style={styles.authSwitchText}>{mode === 'reset' ? 'Request another code' : 'Back to sign in'}</Text>
+                </Pressable>
+              )}
+            </View>
+            <Text style={styles.authFootnote}>Sign-in and reward balances are managed securely by Green Fork.</Text>
+          </View>
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => Promise<void> }) {
   const [tab, setTab] = useState<Tab>('Events');
   const [category, setCategory] = useState<Category>('All');
   const [reservations, setReservations] = useState<string[]>([]);
-  const [points, setPoints] = useState(120);
+  const [points, setPoints] = useState(account.rewardPoints);
+  const [rewards, setRewards] = useState<Reward[]>([]);
+  const [loadingRewards, setLoadingRewards] = useState(true);
   const [redeemed, setRedeemed] = useState<string[]>([]);
   const [selectedReward, setSelectedReward] = useState<Reward | null>(null);
   const [notice, setNotice] = useState('');
+  const [redeeming, setRedeeming] = useState(false);
+  const [redemptionRequest, setRedemptionRequest] = useState<{ rewardId: string; key: string } | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    fetchRewards()
+      .then(items => {
+        if (active) setRewards(items);
+      })
+      .catch(error => {
+        console.error('Unable to load rewards from the API.', error);
+        if (active) setNotice('We could not load rewards. Please try again later.');
+      })
+      .finally(() => {
+        if (active) setLoadingRewards(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   function toggleReservation(id: string) {
     const reserved = reservations.includes(id);
@@ -55,12 +400,29 @@ function LoyaltyApp() {
     setNotice(reserved ? 'Demo reservation canceled.' : 'You’re on the demo guest list! No real booking was made.');
   }
 
-  function redeemReward() {
-    if (!selectedReward || points < selectedReward.points || redeemed.includes(selectedReward.id)) return;
-    setPoints(current => current - selectedReward.points);
-    setRedeemed(current => [...current, selectedReward.id]);
-    setNotice(`${selectedReward.name} redeemed in this demo. No real voucher was issued.`);
-    setSelectedReward(null);
+  async function redeemReward() {
+    if (!selectedReward || points < selectedReward.pointsCost || redeemed.includes(selectedReward.id) || redeeming) return;
+    const reward = selectedReward;
+    const idempotencyKey = redemptionRequest?.rewardId === reward.id
+      ? redemptionRequest.key
+      : Crypto.randomUUID();
+    setRedeeming(true);
+    setRedemptionRequest({ rewardId: reward.id, key: idempotencyKey });
+    try {
+      const redemption = await submitRewardRedemption(reward.id, idempotencyKey);
+      setPoints(redemption.rewardPoints);
+      setRedeemed(current => [...current, reward.id]);
+      setNotice(redemption.alreadyApplied
+        ? `${reward.name} was already redeemed. Your balance has been refreshed.`
+        : `${reward.name} redeemed. No real voucher was issued in this prototype.`);
+      setSelectedReward(null);
+      setRedemptionRequest(null);
+    } catch (error) {
+      console.error('Unable to save the reward redemption.', error);
+      setNotice(error instanceof ApiError ? error.message : 'We could not save this redemption. Please try again.');
+    } finally {
+      setRedeeming(false);
+    }
   }
 
   return (
@@ -75,7 +437,21 @@ function LoyaltyApp() {
               <Text style={styles.brandCaption}>GOOD FOOD. LITTLE PERKS.</Text>
             </View>
           </View>
-          <View style={styles.memberBadge}><Text style={styles.memberText}>☆ Member</Text></View>
+          <View style={styles.memberActions}>
+            <Text numberOfLines={1} style={styles.memberText}>☆ {account.name}</Text>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => {
+                void onSignOut().catch(error => {
+                  console.error('Unable to sign out of the local account.', error);
+                  setNotice('We could not sign out. Please try again.');
+                });
+              }}
+              style={styles.signOutButton}
+            >
+              <Text style={styles.signOutText}>Sign out</Text>
+            </Pressable>
+          </View>
         </View>
         <ScrollView key={tab} contentContainerStyle={styles.content}>
           <Text style={styles.eyebrow}>YOUR NEIGHBORHOOD, REWARDED</Text>
@@ -172,16 +548,17 @@ function LoyaltyApp() {
                 <Text style={styles.featureText}>{Math.max(250 - points, 0)} points to a lunch on us</Text>
               </View>
               <Text accessibilityRole="header" style={styles.sectionTitle}>Pick your next perk</Text>
+              {loadingRewards && <ActivityIndicator color="#234D38" />}
               {rewards.map(reward => {
                 const claimed = redeemed.includes(reward.id);
-                const available = points >= reward.points && !claimed;
+                const available = points >= reward.pointsCost && !claimed;
                 return (
                   <View key={reward.id} style={styles.card}>
                     <View style={styles.rewardHeading}>
                       <Text style={styles.eventIcon} accessible={false}>{reward.icon}</Text>
                       <View style={styles.rewardDetails}>
                         <Text style={styles.cardTitle}>{reward.name}</Text>
-                        <Text style={styles.price}>{reward.points} points</Text>
+                        <Text style={styles.price}>{reward.pointsCost} points</Text>
                       </View>
                     </View>
                     <Pressable accessibilityRole="button" accessibilityLabel={`Redeem ${reward.name}`}
@@ -189,7 +566,7 @@ function LoyaltyApp() {
                       onPress={() => setSelectedReward(reward)}
                       style={({ pressed }) => [styles.button, !available && styles.disabledButton, pressed && styles.pressed]}>
                       <Text style={[styles.buttonText, !available && styles.disabledButtonText]}>
-                        {claimed ? 'Redeemed ✓' : available ? 'Redeem reward  →' : `${reward.points - points} more points to unlock`}
+                        {claimed ? 'Redeemed ✓' : available ? 'Redeem reward  →' : `${reward.pointsCost - points} more points to unlock`}
                       </Text>
                     </Pressable>
                   </View>
@@ -201,7 +578,7 @@ function LoyaltyApp() {
               </View>
             </>
           )}
-          <Text style={styles.footnote}>Demo membership · Sample content only.{'\n'}Reservations and rewards reset when the app reloads.</Text>
+          <Text style={styles.footnote}>Sample events, menu, and rewards.{'\n'}Account, points, and redemptions are server-managed; RSVPs reset on reload.</Text>
         </ScrollView>
 
         <View accessibilityRole="tablist" style={styles.tabBar}>
@@ -220,9 +597,9 @@ function LoyaltyApp() {
         <View style={styles.modalBackdrop}>
           <View accessibilityViewIsModal style={styles.modalCard}>
             <Text accessibilityRole="header" style={styles.sectionTitle}>Enjoy a little perk?</Text>
-            <Text style={styles.description}>Redeem {selectedReward?.name} for {selectedReward?.points} points? This is a demo redemption only.</Text>
-            <Pressable accessibilityRole="button" onPress={redeemReward} style={styles.button}>
-              <Text style={styles.buttonText}>Confirm redemption</Text>
+            <Text style={styles.description}>Redeem {selectedReward?.name} for {selectedReward?.pointsCost} points? No real voucher is issued in this prototype.</Text>
+            <Pressable accessibilityRole="button" disabled={redeeming} onPress={() => void redeemReward()} style={[styles.button, redeeming && styles.pendingButton]}>
+              {redeeming ? <ActivityIndicator color="#FFF" /> : <Text style={styles.buttonText}>Confirm redemption</Text>}
             </Pressable>
             <Pressable accessibilityRole="button" onPress={() => setSelectedReward(null)} style={[styles.button, styles.secondaryButton]}>
               <Text style={styles.secondaryButtonText}>Not right now</Text>
@@ -239,6 +616,23 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#FAF9F5',
   },
+  authKeyboard: { flex: 1 },
+  authScroll: { flexGrow: 1, justifyContent: 'center', padding: 24 },
+  authShell: { width: '100%', maxWidth: 480, alignSelf: 'center', gap: 16 },
+  authCentered: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24, gap: 16 },
+  authEyebrow: { fontSize: 10, fontWeight: '700', color: '#64725F', letterSpacing: 1.8, marginTop: 20 },
+  authTitle: { fontSize: 34, lineHeight: 40, fontWeight: '700', color: '#233B2B', letterSpacing: -1 },
+  authSubtitle: { color: '#657064', fontSize: 15, lineHeight: 23, textAlign: 'center' },
+  authCard: { backgroundColor: '#FFF', borderRadius: 18, padding: 20, borderWidth: 1, borderColor: '#E5E7DD', gap: 16, marginTop: 8 },
+  fieldGroup: { gap: 7 },
+  fieldLabel: { color: '#426046', fontSize: 13, fontWeight: '600' },
+  textInput: { backgroundColor: '#FAF9F5', color: '#233B2B', borderWidth: 1, borderColor: '#DDE2D6', borderRadius: 12, paddingHorizontal: 14, minHeight: 50, fontSize: 15 },
+  authError: { color: '#A12A24', fontSize: 13, lineHeight: 19 },
+  authNotice: { color: '#234D38', fontSize: 13, lineHeight: 19 },
+  authSwitch: { minHeight: 44, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6 },
+  authSwitchText: { color: '#426046', fontSize: 13, fontWeight: '600', textAlign: 'center' },
+  authFootnote: { color: '#657064', fontSize: 11, textAlign: 'center', lineHeight: 18 },
+  pendingButton: { opacity: 0.75 },
   shell: { flex: 1, width: '100%', maxWidth: 760, alignSelf: 'center' },
   header: { padding: 20, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 1, borderBottomColor: '#E5E7DD', gap: 12 },
   brand: { flexDirection: 'row', alignItems: 'center', gap: 10, flexShrink: 1 },
@@ -246,8 +640,10 @@ const styles = StyleSheet.create({
   logoText: { fontSize: 30, fontWeight: '700', color: '#FFF', marginTop: -4 },
   brandName: { color: '#234D38', fontSize: 24, fontWeight: '700', letterSpacing: -1 },
   brandCaption: { color: '#64725F', fontSize: 8, letterSpacing: 1.4, marginTop: 3 },
-  memberBadge: { backgroundColor: '#E9EEDD', paddingHorizontal: 12, paddingVertical: 9, borderRadius: 20 },
-  memberText: { color: '#234D38', fontSize: 12, fontWeight: '600' },
+  memberActions: { alignItems: 'flex-end', gap: 6, flexShrink: 1 },
+  memberText: { color: '#234D38', fontSize: 12, fontWeight: '600', maxWidth: 120 },
+  signOutButton: { backgroundColor: '#E9EEDD', paddingHorizontal: 10, paddingVertical: 7, borderRadius: 16 },
+  signOutText: { color: '#234D38', fontSize: 11, fontWeight: '600' },
   content: { padding: 22, paddingBottom: 30, gap: 16 },
   eyebrow: { fontSize: 10, fontWeight: '700', color: '#64725F', letterSpacing: 1.8, marginTop: 10 },
   title: { fontSize: 34, lineHeight: 40, fontWeight: '700', color: '#233B2B', letterSpacing: -1 },
