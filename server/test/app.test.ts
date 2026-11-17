@@ -4,13 +4,16 @@ import { after, before, test } from 'node:test';
 import { createApp } from '../src/app.js';
 import type {
   Account, AdminReward, AdminUser, EventAttendee, EventInput, EventRecord, MemberEvent,
-  PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, UserRecord, UserRole,
+  PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, SocialIdentityInput,
+  SocialIdentityProvider, SocialIdentityResult, UserRecord, UserRole,
 } from '../src/domain.js';
 import { StoreError } from '../src/domain.js';
 import type { AppConfig } from '../src/config.js';
 import type { EmailSender } from '../src/email.js';
 import type { EmailTokenPurpose, Store } from '../src/store.js';
-import { hashEmailCode, hashOpaqueToken } from '../src/crypto.js';
+import { hashEmailCode, hashOpaqueToken, normalizeEmail } from '../src/crypto.js';
+import { InvalidSocialTokenError } from '../src/socialAuth.js';
+import type { SocialTokenVerifier, VerifiedSocialIdentity } from '../src/socialAuth.js';
 
 type EmailToken = {
   userId: string;
@@ -30,6 +33,9 @@ type MemorySession = {
 
 class MemoryStore implements Store {
   readonly users = new Map<string, UserRecord>();
+  readonly socialNonces = new Map<string, { expiresAt: Date; consumed: boolean }>();
+  readonly socialIdentities = new Map<string, string>();
+  readonly socialProviderByUser = new Map<string, string>();
   readonly emailTokens = new Map<string, EmailToken>();
   readonly sessions = new Map<string, MemorySession>();
   readonly balances = new Map<string, number>();
@@ -73,6 +79,63 @@ class MemoryStore implements Store {
 
   async findUserByEmail(email: string): Promise<UserRecord | null> {
     return this.users.get(email) ?? null;
+  }
+
+  async issueSocialNonce(
+    provider: SocialIdentityProvider,
+    nonceHash: string,
+    expiresAt: Date,
+  ): Promise<void> {
+    this.socialNonces.set(`${provider}:${nonceHash}`, { expiresAt, consumed: false });
+  }
+
+  async resolveSocialIdentity(input: SocialIdentityInput): Promise<SocialIdentityResult> {
+    const nonceKey = `${input.provider}:${input.nonceHash}`;
+    const challenge = this.socialNonces.get(nonceKey);
+    if (!challenge || challenge.consumed || challenge.expiresAt <= new Date()) {
+      throw new StoreError('social_nonce_invalid', 'Sign-in request expired. Please try again.');
+    }
+
+    const identityKey = `${input.provider}:${input.subject}`;
+    const existingId = this.socialIdentities.get(identityKey);
+    if (existingId) {
+      challenge.consumed = true;
+      const user = [...this.users.values()].find(item => item.id === existingId);
+      if (!user) throw new Error('Memory store social identity user not found.');
+      return { kind: 'authenticated', user };
+    }
+    if (!input.email || !input.emailVerified) {
+      throw new StoreError('social_email_unverified', 'A verified email address is required for this sign-in method.');
+    }
+
+    const email = normalizeEmail(input.email);
+    let user = this.users.get(email);
+    if (user) {
+      user.emailVerifiedAt ??= new Date();
+    } else {
+      const name = input.name?.trim();
+      if (!name) return { kind: 'profile_required' };
+      user = {
+        id: input.id,
+        name,
+        email,
+        passwordHash: null,
+        emailVerifiedAt: new Date(),
+        role: 'member',
+      };
+      this.users.set(email, user);
+      this.balances.set(user.id, 0);
+    }
+
+    const providerKey = `${user.id}:${input.provider}`;
+    const linkedIdentity = this.socialProviderByUser.get(providerKey);
+    if (linkedIdentity && linkedIdentity !== identityKey) {
+      throw new StoreError('social_identity_conflict', 'This sign-in method is already linked to another account.');
+    }
+    this.socialIdentities.set(identityKey, user.id);
+    this.socialProviderByUser.set(providerKey, identityKey);
+    challenge.consumed = true;
+    return { kind: 'authenticated', user };
   }
 
   async issueEmailToken(userId: string, purpose: EmailTokenPurpose, tokenHash: string, expiresAt: Date): Promise<void> {
@@ -348,6 +411,8 @@ const config: AppConfig = {
   smtpPassword: '',
   emailFrom: 'test@example.com',
   sessionCookieName: 'gf_refresh',
+  googleClientIds: ['green-fork-google-client-id'],
+  appleBundleId: 'com.greenfork.rewards',
 };
 
 const store = new MemoryStore();
@@ -360,7 +425,16 @@ const emailSender: EmailSender = {
     sentCodes.set('reset_password', code);
   },
 };
-const app = createApp({ config, store, emailSender });
+const socialProfiles = new Map<string, VerifiedSocialIdentity>();
+const socialTokenVerifier: SocialTokenVerifier = {
+  async verify(provider, token) {
+    if (token === 'invalid-token') throw new InvalidSocialTokenError();
+    const profile = socialProfiles.get(`${provider}:${token}`);
+    if (!profile) throw new InvalidSocialTokenError();
+    return profile;
+  },
+};
+const app = createApp({ config, store, emailSender, socialTokenVerifier });
 
 before(async () => {
   await app.ready();
@@ -379,7 +453,9 @@ test('account verification, login, reset, and session revocation work', async ()
   assert.equal(registration.statusCode, 202);
   assert.ok(sentCodes.get('verify_email'));
   assert.equal(store.users.size, 1);
-  assert.equal([...store.users.values()][0].passwordHash.includes('StrongPass!123'), false);
+  const memberPasswordHash = [...store.users.values()][0].passwordHash;
+  assert.ok(memberPasswordHash);
+  assert.equal(memberPasswordHash.includes('StrongPass!123'), false);
 
   const wrongCredentials = await app.inject({
     method: 'POST',
@@ -461,6 +537,151 @@ test('account verification, login, reset, and session revocation work', async ()
     headers: { authorization: `Bearer ${session.accessToken}` },
   });
   assert.equal(revokedProfile.statusCode, 401);
+});
+
+test('social sign-in creates accounts, links verified emails, and consumes nonces once', async () => {
+  const googleToken = 'google-new-member-token';
+  socialProfiles.set('google:google-new-member-token', {
+    subject: 'google-subject-new-member',
+    email: 'social-member@example.com',
+    emailVerified: true,
+    name: null,
+  });
+  const nonceResponse = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/nonce',
+    payload: { provider: 'google' },
+  });
+  assert.equal(nonceResponse.statusCode, 200);
+  const nonce = nonceResponse.json<{ nonce: string }>().nonce;
+
+  const needsName = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/login',
+    headers: { 'x-session-transport': 'native' },
+    payload: { provider: 'google', idToken: googleToken, nonce },
+  });
+  assert.equal(needsName.statusCode, 428);
+  assert.equal(needsName.json<{ error: { code: string } }>().error.code, 'display_name_required');
+
+  const login = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/login',
+    headers: { 'x-session-transport': 'native' },
+    payload: { provider: 'google', idToken: googleToken, nonce, name: 'Social Member' },
+  });
+  assert.equal(login.statusCode, 200);
+  const firstSession = login.json<{ account: Account; refreshToken: string }>();
+  assert.equal(firstSession.account.email, 'social-member@example.com');
+  assert.equal(firstSession.account.role, 'member');
+  assert.ok(firstSession.refreshToken);
+  assert.equal(store.users.get('social-member@example.com')?.passwordHash, null);
+  const passwordLogin = await app.inject({
+    method: 'POST',
+    url: '/api/auth/login',
+    payload: { email: 'social-member@example.com', password: 'StrongPass!123' },
+  });
+  assert.equal(passwordLogin.statusCode, 401);
+
+  const replay = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/login',
+    headers: { 'x-session-transport': 'native' },
+    payload: { provider: 'google', idToken: googleToken, nonce, name: 'Social Member' },
+  });
+  assert.equal(replay.statusCode, 400);
+  assert.equal(replay.json<{ error: { code: string } }>().error.code, 'social_nonce_invalid');
+
+  const repeatNonce = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/nonce',
+    payload: { provider: 'google' },
+  });
+  const repeatLogin = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/login',
+    headers: { 'x-session-transport': 'native' },
+    payload: {
+      provider: 'google',
+      idToken: googleToken,
+      nonce: repeatNonce.json<{ nonce: string }>().nonce,
+    },
+  });
+  assert.equal(repeatLogin.statusCode, 200);
+  assert.equal(repeatLogin.json<{ account: Account }>().account.id, firstSession.account.id);
+
+  const existing = await store.createUser(
+    randomUUID(),
+    'Existing Member',
+    'existing-social@example.com',
+    'existing-password-hash',
+  );
+  assert.ok(existing);
+  existing.emailVerifiedAt = new Date();
+  socialProfiles.set('apple:apple-existing-member-token', {
+    subject: 'apple-subject-existing-member',
+    email: 'EXISTING-SOCIAL@EXAMPLE.COM',
+    emailVerified: true,
+    name: null,
+  });
+  const appleNonce = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/nonce',
+    payload: { provider: 'apple' },
+  });
+  const appleLogin = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/login',
+    headers: { 'x-session-transport': 'native' },
+    payload: {
+      provider: 'apple',
+      idToken: 'apple-existing-member-token',
+      nonce: appleNonce.json<{ nonce: string }>().nonce,
+    },
+  });
+  assert.equal(appleLogin.statusCode, 200);
+  assert.equal(appleLogin.json<{ account: Account }>().account.id, existing.id);
+  assert.equal(existing.passwordHash, 'existing-password-hash');
+
+  socialProfiles.set('google:google-unverified-token', {
+    subject: 'google-subject-unverified',
+    email: 'unverified-social@example.com',
+    emailVerified: false,
+    name: 'Unverified',
+  });
+  const unverifiedNonce = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/nonce',
+    payload: { provider: 'google' },
+  });
+  const unverified = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/login',
+    payload: {
+      provider: 'google',
+      idToken: 'google-unverified-token',
+      nonce: unverifiedNonce.json<{ nonce: string }>().nonce,
+    },
+  });
+  assert.equal(unverified.statusCode, 400);
+  assert.equal(store.users.has('unverified-social@example.com'), false);
+
+  const invalidNonce = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/nonce',
+    payload: { provider: 'google' },
+  });
+  const invalid = await app.inject({
+    method: 'POST',
+    url: '/api/auth/social/login',
+    payload: {
+      provider: 'google',
+      idToken: 'invalid-token',
+      nonce: invalidNonce.json<{ nonce: string }>().nonce,
+    },
+  });
+  assert.equal(invalid.statusCode, 401);
+  assert.equal(invalid.json<{ error: { code: string } }>().error.code, 'invalid_social_credential');
 });
 
 test('cookie session transport requires an allowed browser origin', async () => {

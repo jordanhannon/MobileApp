@@ -1,5 +1,6 @@
 import { StatusBar } from 'expo-status-bar';
 import * as Crypto from 'expo-crypto';
+import * as AppleAuthentication from 'expo-apple-authentication';
 import { useEffect, useState } from 'react';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import {
@@ -7,8 +8,9 @@ import {
 } from 'react-native';
 import {
   Account, ApiError, completePasswordReset, createAccount, requestEmailVerification, requestPasswordReset,
-  restoreActiveAccount, signIn, signOut, verifyEmail,
+  restoreActiveAccount, signIn, signInWithSocialCredential, signOut, verifyEmail, type SocialCredential,
 } from './auth';
+import { beginAppleSignIn, beginGoogleSignIn } from './socialSignIn';
 import { fetchRewards, redeemReward as submitRewardRedemption, Reward } from './rewardsApi';
 import StaffDashboard from './StaffDashboard';
 import { cancelEventRsvp, fetchEvents, rsvpToEvent, type AppEvent } from './eventsApi';
@@ -16,7 +18,7 @@ import { EVENT_TIME_ZONE } from './easternDateTime';
 
 type Tab = 'Events' | 'Menu' | 'Rewards' | 'Staff';
 type Category = 'All' | 'Food' | 'Drinks';
-type AuthMode = 'login' | 'signup' | 'verify' | 'forgot' | 'reset';
+type AuthMode = 'login' | 'signup' | 'verify' | 'forgot' | 'reset' | 'social_profile';
 
 const tabs: { name: Tab; icon: string }[] = [
   { name: 'Events', icon: '◷' },
@@ -114,15 +116,16 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [pending, setPending] = useState(false);
+  const [pendingSocialCredential, setPendingSocialCredential] = useState<SocialCredential | null>(null);
 
   async function submit() {
     const normalizedEmail = email.trim();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    if (mode !== 'social_profile' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
       setError('Enter a valid email address.');
       return;
     }
-    if (mode === 'signup' && name.trim() === '') {
-      setError('Enter your name to create an account.');
+    if ((mode === 'signup' || mode === 'social_profile') && name.trim() === '') {
+      setError(mode === 'signup' ? 'Enter your name to create an account.' : 'Enter your name to finish your account.');
       return;
     }
     if ((mode === 'signup' || mode === 'login' || mode === 'reset') && (password.length < 8 || password.length > 128)) {
@@ -165,10 +168,27 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
           setPassword('');
           setNotice('Your password has been reset. Sign in with the new password.');
           break;
+        case 'social_profile':
+          if (!pendingSocialCredential) {
+            setMode('login');
+            throw new ApiError(400, 'social_sign_in_expired', 'Restart sign-in to continue.');
+          }
+          onAuthenticated(await signInWithSocialCredential({
+            ...pendingSocialCredential,
+            name: name.trim(),
+          }));
+          setPendingSocialCredential(null);
+          break;
       }
     } catch (caughtError) {
       if (caughtError instanceof ApiError) {
         if (caughtError.code === 'email_verification_required') setMode('verify');
+        if (caughtError.code === 'social_nonce_invalid') {
+          setPendingSocialCredential(null);
+          setMode('login');
+          setError('Your sign-in expired. Please start again.');
+          return;
+        }
         setError(caughtError.message);
       } else {
         console.error('Unable to complete account authentication.', caughtError);
@@ -181,8 +201,42 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
 
   function changeMode(nextMode: AuthMode) {
     setMode(nextMode);
+    if (nextMode !== 'social_profile') setPendingSocialCredential(null);
     setError('');
     setNotice('');
+  }
+
+  async function beginSocialLogin(provider: 'google' | 'apple') {
+    setPending(true);
+    setError('');
+    setNotice('');
+    try {
+      const credential = provider === 'google'
+        ? await beginGoogleSignIn()
+        : await beginAppleSignIn();
+      if (!credential) return;
+      try {
+        onAuthenticated(await signInWithSocialCredential(credential));
+      } catch (caughtError) {
+        if (caughtError instanceof ApiError && caughtError.code === 'display_name_required') {
+          setPendingSocialCredential(credential);
+          setName(credential.name ?? '');
+          setMode('social_profile');
+          setNotice('Add your name to finish creating your account.');
+          return;
+        }
+        throw caughtError;
+      }
+    } catch (caughtError) {
+      if (caughtError instanceof ApiError) {
+        setError(caughtError.message);
+      } else {
+        console.error(`Unable to complete ${provider} sign-in.`);
+        setError('We could not complete that sign-in. Please try again.');
+      }
+    } finally {
+      setPending(false);
+    }
   }
 
   async function resendVerificationCode() {
@@ -222,18 +276,20 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
                 : mode === 'signup' ? 'Make yourself at home.'
                   : mode === 'verify' ? 'Check your inbox.'
                     : mode === 'forgot' ? 'Reset your password.'
-                      : 'Choose a new password.'}
+                      : mode === 'reset' ? 'Choose a new password.'
+                        : 'Finish your profile.'}
             </Text>
             <Text style={styles.authSubtitle}>
               {mode === 'login' ? 'Sign in to pick up where the good stuff begins.'
                 : mode === 'signup' ? 'Create an account to join the Green Fork community.'
                   : mode === 'verify' ? 'Enter the verification code sent to your email address.'
                     : mode === 'forgot' ? 'We’ll email you a code if the account is eligible for a reset.'
-                      : 'Enter the code from your email and choose a new password.'}
+                      : mode === 'reset' ? 'Enter the code from your email and choose a new password.'
+                        : 'Your provider did not share a name. Add one to continue.'}
             </Text>
 
             <View style={styles.authCard}>
-              {mode === 'signup' && (
+              {(mode === 'signup' || mode === 'social_profile') && (
                 <View style={styles.fieldGroup}>
                   <Text style={styles.fieldLabel}>Name</Text>
                   <TextInput
@@ -248,21 +304,23 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
                   />
                 </View>
               )}
-              <View style={styles.fieldGroup}>
-                <Text style={styles.fieldLabel}>Email</Text>
-                <TextInput
-                  accessibilityLabel="Email"
-                  autoCapitalize="none"
-                  autoComplete="email"
-                  keyboardType="email-address"
-                  onChangeText={setEmail}
-                  placeholder="you@example.com"
-                  returnKeyType="next"
-                  style={styles.textInput}
-                  textContentType="emailAddress"
-                  value={email}
-                />
-              </View>
+              {mode !== 'social_profile' && (
+                <View style={styles.fieldGroup}>
+                  <Text style={styles.fieldLabel}>Email</Text>
+                  <TextInput
+                    accessibilityLabel="Email"
+                    autoCapitalize="none"
+                    autoComplete="email"
+                    keyboardType="email-address"
+                    onChangeText={setEmail}
+                    placeholder="you@example.com"
+                    returnKeyType="next"
+                    style={styles.textInput}
+                    textContentType="emailAddress"
+                    value={email}
+                  />
+                </View>
+              )}
               {(mode === 'verify' || mode === 'reset') && (
                 <View style={styles.fieldGroup}>
                   <Text style={styles.fieldLabel}>Email code</Text>
@@ -313,9 +371,36 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
                       : mode === 'signup' ? 'Create account'
                         : mode === 'verify' ? 'Verify email'
                           : mode === 'forgot' ? 'Send reset code'
-                            : 'Reset password'}
+                            : mode === 'reset' ? 'Reset password'
+                              : 'Continue'}
                   </Text>}
               </Pressable>
+              {mode === 'login' && Platform.OS !== 'web' && (
+                <View style={styles.socialGroup}>
+                  <Text style={styles.fieldLabel}>OR SIGN IN WITH</Text>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityState={{ disabled: pending }}
+                    disabled={pending}
+                    onPress={() => void beginSocialLogin('google')}
+                    style={({ pressed }) => [styles.socialButton, pending && styles.pendingButton, pressed && styles.pressed]}
+                  >
+                    <Text style={styles.socialButtonText}>Continue with Google</Text>
+                  </Pressable>
+                  {Platform.OS === 'ios' && (
+                    <AppleAuthentication.AppleAuthenticationButton
+                      accessibilityLabel="Sign in with Apple"
+                      buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
+                      buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
+                      cornerRadius={12}
+                      onPress={() => {
+                        if (!pending) void beginSocialLogin('apple');
+                      }}
+                      style={styles.appleButton}
+                    />
+                  )}
+                </View>
+              )}
               {mode === 'login' && (
                 <>
                   <Pressable accessibilityRole="button" disabled={pending} onPress={() => changeMode('forgot')} style={styles.authSwitch}>
@@ -332,6 +417,11 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
               {mode === 'signup' && (
                 <Pressable accessibilityRole="button" disabled={pending} onPress={() => changeMode('login')} style={styles.authSwitch}>
                   <Text style={styles.authSwitchText}>Already a member? Sign in</Text>
+                </Pressable>
+              )}
+              {mode === 'social_profile' && (
+                <Pressable accessibilityRole="button" disabled={pending} onPress={() => changeMode('login')} style={styles.authSwitch}>
+                  <Text style={styles.authSwitchText}>Cancel and return to sign in</Text>
                 </Pressable>
               )}
               {mode === 'verify' && (
@@ -676,6 +766,10 @@ const styles = StyleSheet.create({
   authTitle: { fontSize: 34, lineHeight: 40, fontWeight: '700', color: '#233B2B', letterSpacing: -1 },
   authSubtitle: { color: '#657064', fontSize: 15, lineHeight: 23, textAlign: 'center' },
   authCard: { backgroundColor: '#FFF', borderRadius: 18, padding: 20, borderWidth: 1, borderColor: '#E5E7DD', gap: 16, marginTop: 8 },
+  socialGroup: { gap: 10 },
+  socialButton: { backgroundColor: '#FFF', borderRadius: 12, borderWidth: 1, borderColor: '#DDE2D6', padding: 14, minHeight: 48, alignItems: 'center', justifyContent: 'center' },
+  socialButtonText: { color: '#233B2B', fontSize: 14, fontWeight: '600' },
+  appleButton: { width: '100%', height: 48 },
   fieldGroup: { gap: 7 },
   fieldLabel: { color: '#426046', fontSize: 13, fontWeight: '600' },
   textInput: { backgroundColor: '#FAF9F5', color: '#233B2B', borderWidth: 1, borderColor: '#DDE2D6', borderRadius: 12, paddingHorizontal: 14, minHeight: 50, fontSize: 15 },

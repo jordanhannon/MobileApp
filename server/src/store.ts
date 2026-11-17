@@ -1,6 +1,7 @@
 import type {
   Account, AdminReward, AdminUser, EventAttendee, EventInput, EventRecord, MemberEvent,
-  PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, UserRecord, UserRole,
+  PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, SocialIdentityInput,
+  SocialIdentityProvider, SocialIdentityResult, UserRecord, UserRole,
 } from './domain.js';
 
 export type EmailTokenPurpose = 'verify_email' | 'reset_password';
@@ -8,6 +9,8 @@ export type EmailTokenPurpose = 'verify_email' | 'reset_password';
 export interface Store {
   createUser(id: string, name: string, email: string, passwordHash: string): Promise<UserRecord | null>;
   findUserByEmail(email: string): Promise<UserRecord | null>;
+  issueSocialNonce(provider: SocialIdentityProvider, nonceHash: string, expiresAt: Date): Promise<void>;
+  resolveSocialIdentity(input: SocialIdentityInput): Promise<SocialIdentityResult>;
   issueEmailToken(userId: string, purpose: EmailTokenPurpose, tokenHash: string, expiresAt: Date): Promise<void>;
   verifyEmail(email: string, tokenHash: string): Promise<boolean>;
   resetPassword(email: string, tokenHash: string, passwordHash: string): Promise<boolean>;

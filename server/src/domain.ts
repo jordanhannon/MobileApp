@@ -1,13 +1,28 @@
 export type UserRole = 'member' | 'staff' | 'admin';
+export type SocialIdentityProvider = 'google' | 'apple';
 
 export type UserRecord = {
   id: string;
   name: string;
   email: string;
-  passwordHash: string;
+  passwordHash: string | null;
   emailVerifiedAt: Date | null;
   role: UserRole;
 };
+
+export type SocialIdentityInput = {
+  id: string;
+  provider: SocialIdentityProvider;
+  subject: string;
+  email: string | null;
+  emailVerified: boolean;
+  name: string | null;
+  nonceHash: string;
+};
+
+export type SocialIdentityResult =
+  | { kind: 'authenticated'; user: UserRecord }
+  | { kind: 'profile_required' };
 
 export type Account = {
   id: string;

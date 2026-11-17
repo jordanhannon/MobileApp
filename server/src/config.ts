@@ -13,6 +13,8 @@ export type AppConfig = {
   smtpPassword: string;
   emailFrom: string;
   sessionCookieName: string;
+  googleClientIds: string[];
+  appleBundleId: string;
 };
 
 function required(value: string | undefined, name: string): string {
@@ -54,5 +56,10 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     smtpPassword: env.SMTP_PASSWORD ?? '',
     emailFrom: env.SMTP_FROM ?? 'Green Fork <no-reply@example.com>',
     sessionCookieName: 'gf_refresh',
+    googleClientIds: (env.GOOGLE_CLIENT_IDS ?? '')
+      .split(',')
+      .map((clientId: string) => clientId.trim())
+      .filter(Boolean),
+    appleBundleId: env.APPLE_BUNDLE_ID?.trim() ?? '',
   };
 }

@@ -2,7 +2,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
-import type { Account, EventInput, Reward, UserRole } from './domain.js';
+import type { Account, EventInput, Reward, SocialIdentityProvider, UserRole } from './domain.js';
 import { StoreError } from './domain.js';
 import {
   createEmailCode, createId, createOpaqueToken, hashEmailCode, hashOpaqueToken, hashPassword, normalizeEmail, verifyPassword,
@@ -10,11 +10,14 @@ import {
 import type { AppConfig } from './config.js';
 import type { EmailSender } from './email.js';
 import type { Store } from './store.js';
+import { InvalidSocialTokenError, OidcSocialTokenVerifier } from './socialAuth.js';
+import type { SocialTokenVerifier } from './socialAuth.js';
 
 type AppDependencies = {
   config: AppConfig;
   store: Store;
   emailSender: EmailSender;
+  socialTokenVerifier?: SocialTokenVerifier;
 };
 
 class ApiError extends Error {
@@ -58,6 +61,23 @@ function emailField(body: Record<string, unknown>): string {
     throw new ApiError(400, 'invalid_request', 'Enter a valid email address.');
   }
   return email;
+}
+
+function socialProviderField(body: Record<string, unknown>): SocialIdentityProvider {
+  const provider = body.provider;
+  if (provider !== 'google' && provider !== 'apple') {
+    throw new ApiError(400, 'invalid_request', 'Choose Google or Apple sign-in.');
+  }
+  return provider;
+}
+
+function optionalNameField(body: Record<string, unknown>): string | null {
+  const name = body.name;
+  if (name === undefined || name === null) return null;
+  if (typeof name !== 'string' || name.trim().length > 100) {
+    throw new ApiError(400, 'invalid_request', 'Invalid display name.');
+  }
+  return name.trim() || null;
 }
 
 function passwordField(body: Record<string, unknown>, key = 'password'): string {
@@ -225,7 +245,7 @@ function accountResponse(account: Account): Account {
   return account;
 }
 
-export function createApp({ config, store, emailSender }: AppDependencies) {
+export function createApp({ config, store, emailSender, socialTokenVerifier = new OidcSocialTokenVerifier() }: AppDependencies) {
   const app = Fastify({ logger: config.nodeEnv !== 'test' });
 
   app.decorateRequest('account', null);
@@ -365,12 +385,66 @@ export function createApp({ config, store, emailSender }: AppDependencies) {
     return { verified: true };
   });
 
+  app.post('/api/auth/social/nonce', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async request => {
+    const provider = socialProviderField(bodyRecord(request.body));
+    const audiences = provider === 'google' ? config.googleClientIds : [config.appleBundleId];
+    if (audiences.length === 0 || audiences.every(audience => audience === '')) {
+      throw new ApiError(503, 'social_provider_not_configured', `${provider} sign-in is not configured.`);
+    }
+    const nonce = createOpaqueToken();
+    await store.issueSocialNonce(provider, hashOpaqueToken(nonce), expiresAfterSeconds(5 * 60));
+    return { nonce };
+  });
+
+  app.post(
+    '/api/auth/social/login',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const body = bodyRecord(request.body);
+      const provider = socialProviderField(body);
+      const idToken = stringField(body, 'idToken', 1, 8192);
+      const nonce = stringField(body, 'nonce', 32, 128);
+      const audiences = provider === 'google' ? config.googleClientIds : [config.appleBundleId].filter(Boolean);
+      if (audiences.length === 0) {
+        throw new ApiError(503, 'social_provider_not_configured', `${provider} sign-in is not configured.`);
+      }
+
+      let profile;
+      try {
+        profile = await socialTokenVerifier.verify(provider, idToken, nonce, audiences);
+      } catch (error) {
+        if (error instanceof InvalidSocialTokenError) {
+          throw new ApiError(401, 'invalid_social_credential', 'The identity provider could not verify this sign-in.');
+        }
+        throw error;
+      }
+
+      const email = profile.email ? normalizeEmail(profile.email) : null;
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        throw new ApiError(401, 'invalid_social_credential', 'The identity provider returned an invalid email.');
+      }
+      const result = await store.resolveSocialIdentity({
+        id: createId(),
+        provider,
+        subject: profile.subject,
+        email,
+        emailVerified: profile.emailVerified,
+        name: optionalNameField(body) ?? profile.name,
+        nonceHash: hashOpaqueToken(nonce),
+      });
+      if (result.kind === 'profile_required') {
+        throw new ApiError(428, 'display_name_required', 'Enter your name to finish creating your account.');
+      }
+      return issueSession(request, reply, result.user.id);
+    },
+  );
+
   app.post('/api/auth/login', { config: { rateLimit: { max: 8, timeWindow: '1 minute' } } }, async (request, reply) => {
     const body = bodyRecord(request.body);
     const email = emailField(body);
     const password = passwordField(body);
     const user = await store.findUserByEmail(email);
-    const passwordMatches = user
+    const passwordMatches = user?.passwordHash
       ? await verifyPassword(user.passwordHash, password)
       : await verifyPassword(await missingAccountPasswordHash(), password);
     if (!user || !passwordMatches || !user.emailVerifiedAt) {

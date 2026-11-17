@@ -46,3 +46,5 @@ server/dist/
 # generated native folders
 /ios
 /android
+.env.example
+server/.env.example

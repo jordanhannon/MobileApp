@@ -2,16 +2,18 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Pool, PoolClient, QueryResultRow } from 'pg';
 import type {
   Account, AdminReward, AdminUser, EventAttendee, EventInput, EventRecord, MemberEvent,
-  PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, UserRecord, UserRole,
+  PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, SocialIdentityInput,
+  SocialIdentityResult, UserRecord, UserRole,
 } from './domain.js';
 import { StoreError } from './domain.js';
 import type { EmailTokenPurpose, Store } from './store.js';
+import { normalizeEmail } from './crypto.js';
 
 type UserRow = QueryResultRow & {
   id: string;
   name: string;
   email: string;
-  password_hash: string;
+  password_hash: string | null;
   email_verified_at: Date | null;
   role: UserRole;
 };
@@ -171,6 +173,146 @@ export class PostgresStore implements Store {
       [email],
     );
     return result.rows[0] ? toUser(result.rows[0]) : null;
+  }
+
+  async issueSocialNonce(
+    provider: SocialIdentityInput['provider'],
+    nonceHash: string,
+    expiresAt: Date,
+  ): Promise<void> {
+    await this.pool.query(
+      `DELETE FROM auth_provider_nonces
+       WHERE expires_at < NOW() - INTERVAL '1 day'`,
+    );
+    await this.pool.query(
+      `INSERT INTO auth_provider_nonces (provider, nonce_hash, expires_at)
+       VALUES ($1, $2, $3)`,
+      [provider, nonceHash, expiresAt],
+    );
+  }
+
+  async resolveSocialIdentity(input: SocialIdentityInput): Promise<SocialIdentityResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const challenge = await client.query(
+        `SELECT nonce_hash FROM auth_provider_nonces
+         WHERE provider = $1 AND nonce_hash = $2
+           AND expires_at > NOW() AND consumed_at IS NULL
+         FOR UPDATE`,
+        [input.provider, input.nonceHash],
+      );
+      if (!challenge.rows[0]) throw new StoreError('social_nonce_invalid', 'Sign-in request expired. Please try again.');
+
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        [`social:${input.provider}:${input.subject}`],
+      );
+      let identityUser = await this.findSocialIdentityUser(client, input.provider, input.subject);
+      if (identityUser) {
+        await this.consumeSocialNonce(client, input.provider, input.nonceHash);
+        await client.query('COMMIT');
+        return { kind: 'authenticated', user: identityUser };
+      }
+
+      if (!input.email || !input.emailVerified) {
+        throw new StoreError('social_email_unverified', 'A verified email address is required for this sign-in method.');
+      }
+      const email = normalizeEmail(input.email);
+
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        [`email:${email}`],
+      );
+      identityUser = await this.findSocialIdentityUser(client, input.provider, input.subject);
+      if (identityUser) {
+        await this.consumeSocialNonce(client, input.provider, input.nonceHash);
+        await client.query('COMMIT');
+        return { kind: 'authenticated', user: identityUser };
+      }
+
+      const existing = await client.query<UserRow>(
+        `SELECT id, name, email, password_hash, email_verified_at, role
+         FROM users WHERE LOWER(email) = $1
+         FOR UPDATE`,
+        [email],
+      );
+      let user: UserRecord;
+      if (existing.rows[0]) {
+        const verified = await client.query<UserRow>(
+          `UPDATE users SET email_verified_at = COALESCE(email_verified_at, NOW())
+           WHERE id = $1
+           RETURNING id, name, email, password_hash, email_verified_at, role`,
+          [existing.rows[0].id],
+        );
+        user = toUser(verified.rows[0]);
+      } else {
+        const name = input.name?.trim();
+        if (!name) {
+          await client.query('COMMIT');
+          return { kind: 'profile_required' };
+        }
+        const inserted = await client.query<UserRow>(
+          `INSERT INTO users (id, name, email, password_hash, email_verified_at)
+           VALUES ($1, $2, $3, NULL, NOW())
+           RETURNING id, name, email, password_hash, email_verified_at, role`,
+          [input.id, name, email],
+        );
+        user = toUser(inserted.rows[0]);
+      }
+
+      try {
+        await client.query(
+          `INSERT INTO user_auth_identities (provider, subject, user_id)
+           VALUES ($1, $2, $3)`,
+          [input.provider, input.subject, user.id],
+        );
+      } catch (error) {
+        if (isUniqueViolation(error)) {
+          throw new StoreError('social_identity_conflict', 'This sign-in method is already linked to another account.');
+        }
+        throw error;
+      }
+      await this.consumeSocialNonce(client, input.provider, input.nonceHash);
+      await client.query('COMMIT');
+      return { kind: 'authenticated', user };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async findSocialIdentityUser(
+    client: PoolClient,
+    provider: SocialIdentityInput['provider'],
+    subject: string,
+  ): Promise<UserRecord | null> {
+    const result = await client.query<UserRow>(
+      `SELECT u.id, u.name, u.email, u.password_hash, u.email_verified_at, u.role
+       FROM user_auth_identities i
+       JOIN users u ON u.id = i.user_id
+       WHERE i.provider = $1 AND i.subject = $2
+       FOR UPDATE OF u`,
+      [provider, subject],
+    );
+    return result.rows[0] ? toUser(result.rows[0]) : null;
+  }
+
+  private async consumeSocialNonce(
+    client: PoolClient,
+    provider: SocialIdentityInput['provider'],
+    nonceHash: string,
+  ): Promise<void> {
+    const consumed = await client.query(
+      `UPDATE auth_provider_nonces SET consumed_at = NOW()
+       WHERE provider = $1 AND nonce_hash = $2 AND consumed_at IS NULL`,
+      [provider, nonceHash],
+    );
+    if (consumed.rowCount !== 1) {
+      throw new StoreError('social_nonce_invalid', 'Sign-in request expired. Please try again.');
+    }
   }
 
   async issueEmailToken(

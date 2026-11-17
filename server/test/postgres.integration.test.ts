@@ -3,6 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { test } from 'node:test';
 import { PostgresStore } from '../src/postgresStore.js';
+import { hashOpaqueToken } from '../src/crypto.js';
 
 const connectionString = process.env.TEST_DATABASE_URL;
 
@@ -13,11 +14,13 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
   const store = new PostgresStore(pool);
   const userId = randomUUID();
   const adminId = randomUUID();
+  const socialUserId = randomUUID();
   const email = `integration-${userId}@example.test`;
   const adminEmail = `integration-admin-${adminId}@example.test`;
   const eventId = `integration-${userId.slice(0, 8)}`;
   const monthlyEventId = `monthly-${userId.slice(0, 8)}`;
   const rewardId = `integration-${userId.slice(0, 8)}`;
+  const socialNonceHashes: string[] = [];
   const tokenHash = () => randomBytes(32).toString('hex');
 
   try {
@@ -34,6 +37,81 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
     await store.issueEmailToken(userId, 'verify_email', verificationHash, new Date(Date.now() + 60_000));
     assert.equal(await store.verifyEmail(email, verificationHash), true);
     assert.ok((await store.findUserByEmail(email))?.emailVerifiedAt);
+
+    const socialNonce = randomBytes(32).toString('base64url');
+    const socialNonceHash = hashOpaqueToken(socialNonce);
+    socialNonceHashes.push(socialNonceHash);
+    await store.issueSocialNonce('google', socialNonceHash, new Date(Date.now() + 5 * 60_000));
+    const missingSocialName = await store.resolveSocialIdentity({
+      id: socialUserId,
+      provider: 'google',
+      subject: `google-${socialUserId}`,
+      email: `social-${socialUserId}@example.test`,
+      emailVerified: true,
+      name: null,
+      nonceHash: socialNonceHash,
+    });
+    assert.deepEqual(missingSocialName, { kind: 'profile_required' });
+    const socialUser = await store.resolveSocialIdentity({
+      id: socialUserId,
+      provider: 'google',
+      subject: `google-${socialUserId}`,
+      email: `social-${socialUserId}@example.test`,
+      emailVerified: true,
+      name: 'Social Integration Member',
+      nonceHash: socialNonceHash,
+    });
+    assert.equal(socialUser.kind, 'authenticated');
+    if (socialUser.kind !== 'authenticated') return;
+    assert.equal(socialUser.user.passwordHash, null);
+    assert.equal(socialUser.user.role, 'member');
+    assert.ok(socialUser.user.emailVerifiedAt);
+
+    const linkedNonceHash = hashOpaqueToken(randomBytes(32).toString('base64url'));
+    socialNonceHashes.push(linkedNonceHash);
+    await store.issueSocialNonce('apple', linkedNonceHash, new Date(Date.now() + 5 * 60_000));
+    const linkedIdentity = await store.resolveSocialIdentity({
+      id: randomUUID(),
+      provider: 'apple',
+      subject: `apple-${userId}`,
+      email: email.toUpperCase(),
+      emailVerified: true,
+      name: null,
+      nonceHash: linkedNonceHash,
+    });
+    assert.equal(linkedIdentity.kind, 'authenticated');
+    if (linkedIdentity.kind !== 'authenticated') return;
+    assert.equal(linkedIdentity.user.id, userId);
+    const conflictingAppleNonceHash = hashOpaqueToken(randomBytes(32).toString('base64url'));
+    socialNonceHashes.push(conflictingAppleNonceHash);
+    await store.issueSocialNonce('apple', conflictingAppleNonceHash, new Date(Date.now() + 5 * 60_000));
+    await assert.rejects(
+      () => store.resolveSocialIdentity({
+        id: randomUUID(),
+        provider: 'apple',
+        subject: `different-apple-${userId}`,
+        email,
+        emailVerified: true,
+        name: null,
+        nonceHash: conflictingAppleNonceHash,
+      }),
+      { code: 'social_identity_conflict' },
+    );
+    const returningAppleNonceHash = hashOpaqueToken(randomBytes(32).toString('base64url'));
+    socialNonceHashes.push(returningAppleNonceHash);
+    await store.issueSocialNonce('apple', returningAppleNonceHash, new Date(Date.now() + 5 * 60_000));
+    const returningAppleIdentity = await store.resolveSocialIdentity({
+      id: randomUUID(),
+      provider: 'apple',
+      subject: `apple-${userId}`,
+      email: null,
+      emailVerified: false,
+      name: null,
+      nonceHash: returningAppleNonceHash,
+    });
+    assert.equal(returningAppleIdentity.kind, 'authenticated');
+    if (returningAppleIdentity.kind !== 'authenticated') return;
+    assert.equal(returningAppleIdentity.user.id, userId);
 
     const accessHash = tokenHash();
     const refreshHash = tokenHash();
@@ -225,7 +303,8 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
     await pool.query('DELETE FROM event_rsvps WHERE event_id = $1', [monthlyEventId]);
     await pool.query('DELETE FROM events WHERE id = $1', [monthlyEventId]);
     await pool.query('DELETE FROM rewards WHERE id = $1', [rewardId]);
-    await pool.query('DELETE FROM users WHERE id = ANY($1::UUID[])', [[userId, adminId]]);
+    await pool.query('DELETE FROM auth_provider_nonces WHERE nonce_hash = ANY($1::TEXT[])', [socialNonceHashes]);
+    await pool.query('DELETE FROM users WHERE id = ANY($1::UUID[])', [[userId, adminId, socialUserId]]);
     await pool.end();
   }
 });

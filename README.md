@@ -52,6 +52,32 @@ To stop the local database, run
 `docker compose -f server/compose.yaml down`. Its data remains in a named Docker
 volume.
 
+## Configure native social sign-in
+
+Google sign-in is available on iOS and Android. Apple sign-in is available on
+iOS only. Provider sign-in requires a development or release native build; the
+configured callback and provider app identifiers are not supported by the
+current Expo Go setup. Use `npx expo run:android` for a local Android build or
+an EAS development build; local iOS builds require macOS.
+
+1. Register the configured iOS bundle identifier and Android application ID
+   (`com.greenfork.rewards` by default) in the Google and Apple developer
+   consoles. For Android Google OAuth, also register the signing certificate
+   fingerprints used by your development and release builds.
+   Google AuthSession returns to the native URI
+   `com.greenfork.rewards:/oauthredirect` with the default identifiers.
+2. Set `EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID` and
+   `EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID` in the app `.env` to the corresponding
+   Google OAuth client IDs. Set `GOOGLE_CLIENT_IDS` in `server/.env` to the
+   comma-separated same IDs so the API can validate the token audience.
+3. Enable Sign in with Apple for the iOS app identifier and set
+   `APPLE_BUNDLE_ID` in `server/.env` to that exact identifier. The Expo config
+   enables the iOS capability and native callback scheme.
+4. Rebuild the native app after changing identifiers or provider capabilities.
+   Never place a provider client secret in the app. The API validates provider
+   signatures, issuer, audience, expiry, and one-time nonce before creating or
+   linking a member account; provider tokens are not stored.
+
 ## Validate
 
 ```sh
@@ -69,10 +95,12 @@ migration first with `npm run migrate --prefix server`.
 
 ## Architecture and production notes
 
-- The app sends registration, sign-in, email verification, password reset,
-  session, reward-list, and redemption requests to the API.
-- PostgreSQL stores account records, Argon2id password hashes, hashed session
-  tokens, email action-token hashes, redemptions, and the points ledger.
+- The app sends registration, email/password and social sign-in, email
+  verification, password reset, session, reward-list, and redemption requests
+  to the API.
+- PostgreSQL stores account records, optional Argon2id password hashes,
+  Google/Apple identity mappings, hashed session and OAuth nonce values, email
+  action-token hashes, redemptions, and the points ledger.
 - Native refresh tokens are stored with Expo SecureStore. Web refresh tokens are
   sent in an HTTP-only cookie; serve the production app and API over HTTPS.
 - Reward balances and redemption eligibility are calculated by the server.

@@ -9,6 +9,15 @@ export type Account = {
   role: 'member' | 'staff' | 'admin';
 };
 
+export type SocialProvider = 'google' | 'apple';
+
+export type SocialCredential = {
+  provider: SocialProvider;
+  idToken: string;
+  nonce: string;
+  name?: string;
+};
+
 type SessionResponse = {
   accessToken: string;
   refreshToken?: string;
@@ -174,6 +183,28 @@ export async function signIn(email: string, password: string): Promise<Account> 
     await sendRequest('/auth/login', {
       method: 'POST',
       body: { email, password },
+      retryAuth: false,
+    }),
+  );
+  accessToken = response.accessToken;
+  if (response.refreshToken) await storeRefreshToken(response.refreshToken);
+  return response.account;
+}
+
+export async function requestSocialNonce(provider: SocialProvider): Promise<string> {
+  const response = await apiRequest<{ nonce: string }>('/auth/social/nonce', {
+    method: 'POST',
+    body: { provider },
+    retryAuth: false,
+  });
+  return response.nonce;
+}
+
+export async function signInWithSocialCredential(credential: SocialCredential): Promise<Account> {
+  const response = await parseResponse<SessionResponse>(
+    await sendRequest('/auth/social/login', {
+      method: 'POST',
+      body: credential,
       retryAuth: false,
     }),
   );

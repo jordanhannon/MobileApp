@@ -10,6 +10,7 @@ const migrations = [
   ['001_initial', '001_initial.sql'],
   ['002_rbac_events', '002_rbac_events.sql'],
   ['003_recurring_events', '003_recurring_events.sql'],
+  ['004_social_auth', '004_social_auth.sql'],
 ] as const;
 
 try {
