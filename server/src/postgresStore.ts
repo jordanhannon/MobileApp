@@ -1,6 +1,10 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Pool, PoolClient, QueryResultRow } from 'pg';
-import type { Account, RedemptionResult, Reward, UserRecord } from './domain.js';
+import type {
+  Account, AdminReward, AdminUser, EventAttendee, EventInput, EventRecord, MemberEvent,
+  PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, UserRecord, UserRole,
+} from './domain.js';
+import { StoreError } from './domain.js';
 import type { EmailTokenPurpose, Store } from './store.js';
 
 type UserRow = QueryResultRow & {
@@ -9,6 +13,7 @@ type UserRow = QueryResultRow & {
   email: string;
   password_hash: string;
   email_verified_at: Date | null;
+  role: UserRole;
 };
 
 type AccountRow = QueryResultRow & {
@@ -16,6 +21,7 @@ type AccountRow = QueryResultRow & {
   name: string;
   email: string;
   reward_points: string | number;
+  role: UserRole;
 };
 
 type RewardRow = QueryResultRow & {
@@ -23,6 +29,38 @@ type RewardRow = QueryResultRow & {
   name: string;
   points_cost: number;
   icon: string;
+  active?: boolean;
+};
+
+type EventRow = QueryResultRow & {
+  id: string;
+  title: string;
+  starts_at: Date;
+  description: string;
+  tag: string;
+  capacity: number | null;
+  rsvp_open: boolean;
+  recurrence: EventRecord['recurrence'];
+  recurrence_until: string | null;
+  active: boolean;
+};
+
+type EventListRow = EventRow & {
+  occurrence_start: Date;
+  attendee_count: string | number;
+  reserved: boolean | null;
+};
+
+type AdminUserRow = AccountRow & {
+  email_verified_at: Date | null;
+};
+
+type LedgerRow = QueryResultRow & {
+  id: string;
+  delta: number;
+  entry_type: string;
+  reference_id: string | null;
+  created_at: Date;
 };
 
 function toUser(row: UserRow): UserRecord {
@@ -32,6 +70,7 @@ function toUser(row: UserRow): UserRecord {
     email: row.email,
     passwordHash: row.password_hash,
     emailVerifiedAt: row.email_verified_at,
+    role: row.role,
   };
 }
 
@@ -41,11 +80,51 @@ function toAccount(row: AccountRow): Account {
     name: row.name,
     email: row.email,
     rewardPoints: Number(row.reward_points),
+    role: row.role,
   };
 }
 
 function toReward(row: RewardRow): Reward {
   return { id: row.id, name: row.name, pointsCost: row.points_cost, icon: row.icon };
+}
+
+function toAdminReward(row: RewardRow): AdminReward {
+  return { ...toReward(row), active: Boolean(row.active) };
+}
+
+function toEvent(row: EventRow): EventRecord {
+  return {
+    id: row.id,
+    title: row.title,
+    startsAt: row.starts_at.toISOString(),
+    description: row.description,
+    tag: row.tag,
+    capacity: row.capacity,
+    rsvpOpen: row.rsvp_open,
+    recurrence: row.recurrence,
+    recurrenceUntil: row.recurrence_until,
+    active: row.active,
+  };
+}
+
+function toMemberEvent(row: EventListRow): MemberEvent {
+  return {
+    ...toEvent(row),
+    startsAt: row.occurrence_start.toISOString(),
+    occurrenceStart: row.occurrence_start.toISOString(),
+    attendeeCount: Number(row.attendee_count),
+    reserved: Boolean(row.reserved),
+  };
+}
+
+function toPointsLedgerEntry(row: LedgerRow): PointsLedgerEntry {
+  return {
+    id: row.id,
+    delta: row.delta,
+    entryType: row.entry_type,
+    referenceId: row.reference_id,
+    createdAt: row.created_at.toISOString(),
+  };
 }
 
 function isUniqueViolation(error: unknown): boolean {
@@ -54,7 +133,8 @@ function isUniqueViolation(error: unknown): boolean {
 
 async function accountByUserId(client: Pool | PoolClient, userId: string): Promise<Account> {
   const result = await client.query<AccountRow>(
-    `SELECT u.id, u.name, u.email, COALESCE(SUM(l.delta), 0)::INTEGER AS reward_points
+    `SELECT u.id, u.name, u.email, u.role,
+            COALESCE(SUM(l.delta), 0)::INTEGER AS reward_points
      FROM users u
      LEFT JOIN points_ledger l ON l.user_id = u.id
      WHERE u.id = $1
@@ -74,7 +154,7 @@ export class PostgresStore implements Store {
       const result = await this.pool.query<UserRow>(
         `INSERT INTO users (id, name, email, password_hash)
          VALUES ($1, $2, $3, $4)
-         RETURNING id, name, email, password_hash, email_verified_at`,
+         RETURNING id, name, email, password_hash, email_verified_at, role`,
         [id, name, email, passwordHash],
       );
       return result.rows[0] ? toUser(result.rows[0]) : null;
@@ -86,7 +166,7 @@ export class PostgresStore implements Store {
 
   async findUserByEmail(email: string): Promise<UserRecord | null> {
     const result = await this.pool.query<UserRow>(
-      `SELECT id, name, email, password_hash, email_verified_at
+      `SELECT id, name, email, password_hash, email_verified_at, role
        FROM users WHERE LOWER(email) = $1`,
       [email],
     );
@@ -341,5 +421,591 @@ export class PostgresStore implements Store {
     } finally {
       client.release();
     }
+  }
+
+  async listEvents(userId: string): Promise<MemberEvent[]> {
+    const result = await this.pool.query<EventListRow>(
+      `WITH clock AS (
+         SELECT NOW() AS now_utc, NOW() AT TIME ZONE 'America/New_York' AS now_local
+       ), anchors AS (
+         SELECT e.*,
+                e.starts_at AT TIME ZONE 'America/New_York' AS local_start,
+                clock.now_utc,
+                CASE e.recurrence
+                  WHEN 'weekly' THEN GREATEST(
+                    0,
+                    FLOOR(EXTRACT(EPOCH FROM (
+                      clock.now_local - (e.starts_at AT TIME ZONE 'America/New_York')
+                    )) / 604800)::INTEGER
+                  )
+                  WHEN 'monthly' THEN GREATEST(
+                    0,
+                    (
+                      (EXTRACT(YEAR FROM clock.now_local)::INTEGER -
+                       EXTRACT(YEAR FROM (e.starts_at AT TIME ZONE 'America/New_York'))::INTEGER) * 12
+                      + EXTRACT(MONTH FROM clock.now_local)::INTEGER
+                      - EXTRACT(MONTH FROM (e.starts_at AT TIME ZONE 'America/New_York'))::INTEGER
+                      - 1
+                    )
+                  )
+                  ELSE 0
+                END AS first_index
+         FROM events e
+         CROSS JOIN clock
+         WHERE e.active = TRUE
+       ), generated AS (
+         SELECT anchors.*,
+                (
+                  local_start + CASE recurrence
+                    WHEN 'weekly' THEN indices.n * INTERVAL '1 week'
+                    WHEN 'monthly' THEN indices.n * INTERVAL '1 month'
+                    ELSE INTERVAL '0'
+                  END
+                ) AT TIME ZONE 'America/New_York' AS occurrence_start
+         FROM anchors
+         CROSS JOIN LATERAL generate_series(
+           first_index,
+           CASE WHEN recurrence = 'none' THEN 0 ELSE first_index + 12 END
+         ) AS indices(n)
+       ), ranked AS (
+         SELECT generated.*,
+                ROW_NUMBER() OVER (PARTITION BY id ORDER BY occurrence_start) AS occurrence_number
+         FROM generated
+         WHERE occurrence_start >= now_utc
+           AND (
+             recurrence_until IS NULL
+             OR (occurrence_start AT TIME ZONE 'America/New_York')::DATE <= recurrence_until
+           )
+       )
+       SELECT e.id, e.title, e.starts_at, e.description, e.tag, e.capacity,
+              e.rsvp_open, e.recurrence, e.recurrence_until::TEXT AS recurrence_until, e.active,
+              e.occurrence_start, COUNT(r.user_id)::INTEGER AS attendee_count,
+              COALESCE(BOOL_OR(r.user_id = $1), FALSE) AS reserved
+       FROM ranked e
+       LEFT JOIN event_rsvps r
+         ON r.event_id = e.id AND r.occurrence_start = e.occurrence_start
+       WHERE e.occurrence_number <= 12
+       GROUP BY e.id, e.title, e.starts_at, e.description, e.tag, e.capacity,
+                e.rsvp_open, e.recurrence, e.recurrence_until, e.active, e.occurrence_start
+       ORDER BY e.occurrence_start, e.id`,
+      [userId],
+    );
+    return result.rows.map(toMemberEvent);
+  }
+
+  async rsvpToEvent(
+    userId: string,
+    eventId: string,
+    occurrenceStart: string,
+  ): Promise<'rsvped' | 'already_rsvped'> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const eventResult = await client.query<QueryResultRow & {
+        starts_at: Date;
+        capacity: number | null;
+        rsvp_open: boolean;
+        recurrence: EventRecord['recurrence'];
+        recurrence_until: string | null;
+        active: boolean;
+      }>(
+        `SELECT starts_at, capacity, rsvp_open, recurrence,
+                recurrence_until::TEXT AS recurrence_until, active
+         FROM events WHERE id = $1 FOR UPDATE`,
+        [eventId],
+      );
+      const event = eventResult.rows[0];
+      if (!event || !event.active) throw new StoreError('event_not_found', 'Event not found.');
+      await this.assertEventOccurrence(eventId, occurrenceStart, event, client);
+
+      const existing = await client.query(
+        'SELECT 1 FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2 AND user_id = $3',
+        [eventId, occurrenceStart, userId],
+      );
+      if (existing.rowCount) {
+        await client.query('COMMIT');
+        return 'already_rsvped';
+      }
+      if (!event.rsvp_open) throw new StoreError('rsvp_closed', 'RSVPs are closed for this event.');
+
+      const count = await client.query<QueryResultRow & { total: string }>(
+        'SELECT COUNT(*)::TEXT AS total FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2',
+        [eventId, occurrenceStart],
+      );
+      if (event.capacity !== null && Number(count.rows[0].total) >= event.capacity) {
+        throw new StoreError('event_full', 'This event has reached capacity.');
+      }
+
+      await client.query(
+        'INSERT INTO event_rsvps (event_id, occurrence_start, user_id) VALUES ($1, $2, $3)',
+        [eventId, occurrenceStart, userId],
+      );
+      await client.query('COMMIT');
+      return 'rsvped';
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async cancelEventRsvp(userId: string, eventId: string, occurrenceStart: string): Promise<boolean> {
+    const eventResult = await this.pool.query<EventRow>(
+      `SELECT id, title, starts_at, description, tag, capacity, rsvp_open,
+             recurrence, recurrence_until::TEXT AS recurrence_until, active
+       FROM events WHERE id = $1`,
+      [eventId],
+    );
+    const event = eventResult.rows[0];
+    if (!event) throw new StoreError('event_not_found', 'Event not found.');
+    await this.assertEventOccurrence(eventId, occurrenceStart, event, this.pool);
+    const result = await this.pool.query(
+      'DELETE FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2 AND user_id = $3',
+      [eventId, occurrenceStart, userId],
+    );
+    return Boolean(result.rowCount);
+  }
+
+  async listEventAttendees(
+    eventId: string,
+    occurrenceStart: string,
+    limit: number,
+    offset: number,
+  ): Promise<{ event: EventRecord; total: number; attendees: EventAttendee[] }> {
+    const eventResult = await this.pool.query<EventRow>(
+      `SELECT id, title, starts_at, description, tag, capacity, rsvp_open,
+             recurrence, recurrence_until::TEXT AS recurrence_until, active
+       FROM events WHERE id = $1`,
+      [eventId],
+    );
+    const eventRow = eventResult.rows[0];
+    if (!eventRow) throw new StoreError('event_not_found', 'Event not found.');
+    await this.assertEventOccurrence(eventId, occurrenceStart, eventRow, this.pool);
+
+    const [countResult, attendeeResult] = await Promise.all([
+      this.pool.query<QueryResultRow & { total: string }>(
+        'SELECT COUNT(*)::TEXT AS total FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2',
+        [eventId, occurrenceStart],
+      ),
+      this.pool.query<QueryResultRow & { user_id: string; name: string; created_at: Date }>(
+        `SELECT u.id AS user_id, u.name, r.created_at
+         FROM event_rsvps r
+         JOIN users u ON u.id = r.user_id
+         WHERE r.event_id = $1 AND r.occurrence_start = $2
+         ORDER BY r.created_at, u.id
+         LIMIT $3 OFFSET $4`,
+        [eventId, occurrenceStart, limit, offset],
+      ),
+    ]);
+
+    return {
+      event: toEvent(eventRow),
+      total: Number(countResult.rows[0].total),
+      attendees: attendeeResult.rows.map(row => ({
+        userId: row.user_id,
+        name: row.name,
+        rsvpAt: row.created_at.toISOString(),
+      })),
+    };
+  }
+
+  async searchUsers(
+    query: string,
+    limit: number,
+    offset: number,
+  ): Promise<{ users: AdminUser[]; total: number }> {
+    const normalizedQuery = query.trim().toLowerCase();
+    const predicate = `($1 = '' OR POSITION($1 IN LOWER(u.name)) > 0 OR POSITION($1 IN LOWER(u.email)) > 0)`;
+    const [countResult, usersResult] = await Promise.all([
+      this.pool.query<QueryResultRow & { total: string }>(
+        `SELECT COUNT(*)::TEXT AS total FROM users u WHERE ${predicate}`,
+        [normalizedQuery],
+      ),
+      this.pool.query<AdminUserRow>(
+        `SELECT u.id, u.name, u.email, u.role, u.email_verified_at,
+                COALESCE(b.balance, 0)::INTEGER AS reward_points
+         FROM users u
+         LEFT JOIN (
+           SELECT user_id, SUM(delta)::BIGINT AS balance
+           FROM points_ledger GROUP BY user_id
+         ) b ON b.user_id = u.id
+         WHERE ${predicate}
+         ORDER BY LOWER(u.email), u.id
+         LIMIT $2 OFFSET $3`,
+        [normalizedQuery, limit, offset],
+      ),
+    ]);
+    return {
+      users: usersResult.rows.map(row => ({
+        ...toAccount(row),
+        emailVerifiedAt: row.email_verified_at?.toISOString() ?? null,
+      })),
+      total: Number(countResult.rows[0].total),
+    };
+  }
+
+  async getPointsSummary(): Promise<PointsSummary> {
+    const result = await this.pool.query<QueryResultRow & {
+      total_users: string;
+      users_with_points: string;
+      total_points: string;
+    }>(
+      `WITH balances AS (
+         SELECT user_id, SUM(delta)::BIGINT AS balance
+         FROM points_ledger GROUP BY user_id
+       )
+       SELECT COUNT(*)::TEXT AS total_users,
+              COUNT(*) FILTER (WHERE COALESCE(b.balance, 0) > 0)::TEXT AS users_with_points,
+              COALESCE(SUM(b.balance), 0)::TEXT AS total_points
+       FROM users u
+       LEFT JOIN balances b ON b.user_id = u.id`,
+    );
+    const row = result.rows[0];
+    return {
+      totalUsers: Number(row.total_users),
+      usersWithPoints: Number(row.users_with_points),
+      totalPoints: Number(row.total_points),
+    };
+  }
+
+  async getUserPoints(
+    userId: string,
+    limit: number,
+    offset: number,
+  ): Promise<{ balance: number; entries: PointsLedgerEntry[]; total: number }> {
+    const account = await accountByUserId(this.pool, userId);
+    const [countResult, entriesResult] = await Promise.all([
+      this.pool.query<QueryResultRow & { total: string }>(
+        'SELECT COUNT(*)::TEXT AS total FROM points_ledger WHERE user_id = $1',
+        [userId],
+      ),
+      this.pool.query<LedgerRow>(
+        `SELECT id, delta, entry_type, reference_id, created_at
+         FROM points_ledger
+         WHERE user_id = $1
+         ORDER BY created_at DESC, id DESC
+         LIMIT $2 OFFSET $3`,
+        [userId, limit, offset],
+      ),
+    ]);
+    return {
+      balance: account.rewardPoints,
+      entries: entriesResult.rows.map(toPointsLedgerEntry),
+      total: Number(countResult.rows[0].total),
+    };
+  }
+
+  async listAdminEvents(): Promise<EventRecord[]> {
+    const result = await this.pool.query<EventRow>(
+      `SELECT id, title, starts_at, description, tag, capacity, rsvp_open,
+              recurrence, recurrence_until::TEXT AS recurrence_until, active
+       FROM events ORDER BY starts_at, id`,
+    );
+    return result.rows.map(toEvent);
+  }
+
+  async listAdminRewards(): Promise<AdminReward[]> {
+    const result = await this.pool.query<RewardRow>(
+      'SELECT id, name, points_cost, icon, active FROM rewards ORDER BY points_cost, id',
+    );
+    return result.rows.map(toAdminReward);
+  }
+
+  async createEvent(actorId: string, input: EventInput): Promise<EventRecord> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<EventRow>(
+        `INSERT INTO events
+           (id, title, starts_at, description, tag, capacity, rsvp_open, recurrence, recurrence_until)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id, title, starts_at, description, tag, capacity, rsvp_open,
+                   recurrence, recurrence_until::TEXT AS recurrence_until, active`,
+        [
+          input.id, input.title, input.startsAt, input.description,
+          input.tag, input.capacity, input.rsvpOpen, input.recurrence, input.recurrenceUntil,
+        ],
+      );
+      const event = toEvent(result.rows[0]);
+      await this.writeAudit(client, actorId, 'event.create', 'event', event.id, { after: event });
+      await client.query('COMMIT');
+      return event;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      if (isUniqueViolation(error)) throw new StoreError('event_conflict', 'An event with this ID already exists.');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async updateEvent(actorId: string, eventId: string, input: EventInput): Promise<EventRecord> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const currentResult = await client.query<EventRow>(
+        `SELECT id, title, starts_at, description, tag, capacity, rsvp_open,
+                recurrence, recurrence_until::TEXT AS recurrence_until, active
+         FROM events WHERE id = $1 FOR UPDATE`,
+        [eventId],
+      );
+      const current = currentResult.rows[0];
+      if (!current) throw new StoreError('event_not_found', 'Event not found.');
+      const rsvpCount = await client.query<QueryResultRow & { total: string }>(
+        'SELECT COUNT(*)::TEXT AS total FROM event_rsvps WHERE event_id = $1',
+        [eventId],
+      );
+      if (Number(rsvpCount.rows[0].total) > 0 &&
+        (current.starts_at.getTime() !== new Date(input.startsAt).getTime() ||
+          current.recurrence !== input.recurrence ||
+          current.recurrence_until !== input.recurrenceUntil)) {
+        throw new StoreError(
+          'event_schedule_conflict',
+          'The event schedule cannot change after attendees have RSVP’d. Archive this series and create a new one.',
+        );
+      }
+      const overCapacity = input.capacity === null ? false : (await client.query<QueryResultRow & { over_capacity: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM event_rsvps
+           WHERE event_id = $1
+           GROUP BY occurrence_start
+           HAVING COUNT(*) > $2
+         ) AS over_capacity`,
+        [eventId, input.capacity],
+      )).rows[0].over_capacity;
+      if (overCapacity) {
+        throw new StoreError('capacity_below_attendance', 'Capacity cannot be lower than the current RSVP count.');
+      }
+      const result = await client.query<EventRow>(
+        `UPDATE events
+         SET title = $2, starts_at = $3, description = $4, tag = $5, capacity = $6,
+             rsvp_open = $7, recurrence = $8, recurrence_until = $9, updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, title, starts_at, description, tag, capacity, rsvp_open,
+                   recurrence, recurrence_until::TEXT AS recurrence_until, active`,
+        [
+          eventId, input.title, input.startsAt, input.description, input.tag,
+          input.capacity, input.rsvpOpen, input.recurrence, input.recurrenceUntil,
+        ],
+      );
+      const event = toEvent(result.rows[0]);
+      await this.writeAudit(client, actorId, 'event.update', 'event', eventId, {
+        before: toEvent(current),
+        after: event,
+      });
+      await client.query('COMMIT');
+      return event;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async archiveEvent(actorId: string, eventId: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<EventRow>(
+        `UPDATE events SET active = FALSE, rsvp_open = FALSE, updated_at = NOW()
+         WHERE id = $1 AND active = TRUE
+         RETURNING id, title, starts_at, description, tag, capacity, rsvp_open,
+                   recurrence, recurrence_until::TEXT AS recurrence_until, active`,
+        [eventId],
+      );
+      const event = result.rows[0];
+      if (!event) throw new StoreError('event_not_found', 'Event not found or already archived.');
+      await this.writeAudit(client, actorId, 'event.archive', 'event', eventId, {
+        after: toEvent(event),
+      });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async createReward(actorId: string, reward: Reward): Promise<AdminReward> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<RewardRow>(
+        `INSERT INTO rewards (id, name, points_cost, icon, active)
+         VALUES ($1, $2, $3, $4, TRUE)
+         RETURNING id, name, points_cost, icon, active`,
+        [reward.id, reward.name, reward.pointsCost, reward.icon],
+      );
+      const created = toAdminReward(result.rows[0]);
+      await this.writeAudit(client, actorId, 'reward.create', 'reward', created.id, { after: created });
+      await client.query('COMMIT');
+      return created;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      if (isUniqueViolation(error)) throw new StoreError('reward_conflict', 'A reward with this ID already exists.');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async updateReward(
+    actorId: string,
+    rewardId: string,
+    reward: Omit<Reward, 'id'>,
+  ): Promise<AdminReward> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const currentResult = await client.query<RewardRow>(
+        'SELECT id, name, points_cost, icon, active FROM rewards WHERE id = $1 FOR UPDATE',
+        [rewardId],
+      );
+      const current = currentResult.rows[0];
+      if (!current) throw new StoreError('reward_not_found', 'Reward not found.');
+      const result = await client.query<RewardRow>(
+        `UPDATE rewards SET name = $2, points_cost = $3, icon = $4
+         WHERE id = $1
+         RETURNING id, name, points_cost, icon, active`,
+        [rewardId, reward.name, reward.pointsCost, reward.icon],
+      );
+      const updated = toAdminReward(result.rows[0]);
+      await this.writeAudit(client, actorId, 'reward.update', 'reward', rewardId, {
+        before: toAdminReward(current),
+        after: updated,
+      });
+      await client.query('COMMIT');
+      return updated;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async archiveReward(actorId: string, rewardId: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<RewardRow>(
+        `UPDATE rewards SET active = FALSE
+         WHERE id = $1 AND active = TRUE
+         RETURNING id, name, points_cost, icon, active`,
+        [rewardId],
+      );
+      const reward = result.rows[0];
+      if (!reward) throw new StoreError('reward_not_found', 'Reward not found or already archived.');
+      await this.writeAudit(client, actorId, 'reward.archive', 'reward', rewardId, {
+        after: toAdminReward(reward),
+      });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async assignUserRole(actorId: string, userId: string, role: UserRole): Promise<void> {
+    if (actorId === userId) throw new StoreError('self_role_change', 'Admins cannot change their own role.');
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(72610423::BIGINT)');
+      const result = await client.query<QueryResultRow & { id: string; role: UserRole }>(
+        'SELECT id, role FROM users WHERE id = $1 FOR UPDATE',
+        [userId],
+      );
+      const target = result.rows[0];
+      if (!target) throw new StoreError('user_not_found', 'User not found.');
+      if (target.role === role) {
+        await client.query('COMMIT');
+        return;
+      }
+      if (target.role === 'admin' && role !== 'admin') {
+        const admins = await client.query<QueryResultRow & { total: string }>(
+          "SELECT COUNT(*)::TEXT AS total FROM users WHERE role = 'admin'",
+        );
+        if (Number(admins.rows[0].total) <= 1) {
+          throw new StoreError('last_admin', 'The last admin cannot be demoted.');
+        }
+      }
+      await client.query('UPDATE users SET role = $2 WHERE id = $1', [userId, role]);
+      await this.writeAudit(client, actorId, 'user.role_change', 'user', userId, {
+        before: { role: target.role },
+        after: { role },
+      });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async assertEventOccurrence(
+    eventId: string,
+    occurrenceStart: string,
+    event: Pick<EventRow, 'starts_at' | 'recurrence' | 'recurrence_until'>,
+    executor: Pool | PoolClient,
+  ): Promise<void> {
+    const result = await executor.query<QueryResultRow & { valid: boolean }>(
+      `WITH values AS (
+         SELECT $1::TIMESTAMPTZ AS occurrence_start,
+                $2::TIMESTAMPTZ AS starts_at,
+                $3::TEXT AS recurrence,
+                $4::DATE AS recurrence_until
+       ), local_values AS (
+         SELECT *,
+                occurrence_start AT TIME ZONE 'America/New_York' AS occurrence_local,
+                starts_at AT TIME ZONE 'America/New_York' AS start_local
+         FROM values
+       ), indexed AS (
+         SELECT *,
+                (
+                  (EXTRACT(YEAR FROM occurrence_local)::INTEGER -
+                   EXTRACT(YEAR FROM start_local)::INTEGER) * 12
+                  + EXTRACT(MONTH FROM occurrence_local)::INTEGER
+                  - EXTRACT(MONTH FROM start_local)::INTEGER
+                ) AS month_index
+         FROM local_values
+       )
+       SELECT
+         CASE recurrence
+           WHEN 'none' THEN occurrence_start = starts_at
+           WHEN 'weekly' THEN occurrence_local >= start_local
+             AND MOD(EXTRACT(EPOCH FROM (occurrence_local - start_local))::NUMERIC, 604800) = 0
+           WHEN 'monthly' THEN occurrence_local >= start_local
+             AND occurrence_local = start_local + month_index * INTERVAL '1 month'
+           ELSE FALSE
+         END
+         AND (recurrence_until IS NULL OR occurrence_local::DATE <= recurrence_until) AS valid
+       FROM indexed`,
+      [occurrenceStart, event.starts_at, event.recurrence, event.recurrence_until],
+    );
+    if (!result.rows[0]?.valid) {
+      throw new StoreError('event_occurrence_not_found', `The requested occurrence is not part of event ${eventId}.`);
+    }
+  }
+
+  private async writeAudit(
+    client: PoolClient,
+    actorId: string,
+    action: string,
+    targetType: string,
+    targetId: string,
+    changes: unknown,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO admin_audit_log (id, actor_user_id, action, target_type, target_id, changes)
+       VALUES ($1, $2, $3, $4, $5, $6::JSONB)`,
+      [randomUUID(), actorId, action, targetType, targetId, JSON.stringify(changes)],
+    );
   }
 }

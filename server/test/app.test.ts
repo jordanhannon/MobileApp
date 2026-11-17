@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { createApp } from '../src/app.js';
-import type { Account, RedemptionResult, Reward, UserRecord } from '../src/domain.js';
+import type {
+  Account, AdminReward, AdminUser, EventAttendee, EventInput, EventRecord, MemberEvent,
+  PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, UserRecord, UserRole,
+} from '../src/domain.js';
+import { StoreError } from '../src/domain.js';
 import type { AppConfig } from '../src/config.js';
 import type { EmailSender } from '../src/email.js';
 import type { EmailTokenPurpose, Store } from '../src/store.js';
@@ -29,6 +34,29 @@ class MemoryStore implements Store {
   readonly sessions = new Map<string, MemorySession>();
   readonly balances = new Map<string, number>();
   readonly redemptions = new Map<string, Extract<RedemptionResult, { kind: 'redeemed' }>>();
+  readonly rsvps = new Map<string, Set<string>>();
+  readonly audit: Array<{ actorId: string; action: string; targetId: string }> = [];
+  readonly events: EventRecord[] = [
+    {
+      id: 'tasting',
+      title: 'A taste of the season',
+      startsAt: '2026-11-14T16:00:00.000Z',
+      description: 'Meet our seasonal favorites with a tasting made for our members.',
+      tag: 'MEMBER EXCLUSIVE',
+      capacity: null,
+      rsvpOpen: true,
+      recurrence: 'none',
+      recurrenceUntil: null,
+      active: true,
+    },
+  ];
+  readonly adminRewards = new Map<string, AdminReward>(
+    [
+      { id: 'coffee', name: 'A coffee on us', pointsCost: 100, icon: '☕', active: true },
+      { id: 'pastry', name: 'Your favorite pastry', pointsCost: 150, icon: '🥐', active: true },
+      { id: 'lunch', name: 'Lunch, with love', pointsCost: 250, icon: '🥗', active: true },
+    ].map(reward => [reward.id, reward]),
+  );
   readonly rewards: Reward[] = [
     { id: 'coffee', name: 'A coffee on us', pointsCost: 100, icon: '☕' },
     { id: 'pastry', name: 'Your favorite pastry', pointsCost: 150, icon: '🥐' },
@@ -37,7 +65,7 @@ class MemoryStore implements Store {
 
   async createUser(id: string, name: string, email: string, passwordHash: string): Promise<UserRecord | null> {
     if (this.users.has(email)) return null;
-    const user = { id, name, email, passwordHash, emailVerifiedAt: null };
+    const user = { id, name, email, passwordHash, emailVerifiedAt: null, role: 'member' as UserRole };
     this.users.set(email, user);
     this.balances.set(id, 0);
     return user;
@@ -120,7 +148,7 @@ class MemoryStore implements Store {
   }
 
   async listRewards(): Promise<Reward[]> {
-    return this.rewards;
+    return [...this.adminRewards.values()].filter(reward => reward.active);
   }
 
   async redeem(userId: string, rewardId: string, idempotencyKey: string): Promise<RedemptionResult> {
@@ -143,6 +171,155 @@ class MemoryStore implements Store {
     return result;
   }
 
+  async listEvents(userId: string): Promise<MemberEvent[]> {
+    return this.events.filter(event => event.active).map(event => ({
+      ...event,
+      occurrenceStart: event.startsAt,
+      attendeeCount: this.rsvps.get(`${event.id}:${event.startsAt}`)?.size ?? 0,
+      reserved: this.rsvps.get(`${event.id}:${event.startsAt}`)?.has(userId) ?? false,
+    }));
+  }
+
+  async rsvpToEvent(userId: string, eventId: string, occurrenceStart: string): Promise<'rsvped' | 'already_rsvped'> {
+    const event = this.events.find(item => item.id === eventId && item.active);
+    if (!event) throw new StoreError('event_not_found', 'Event not found.');
+    const key = `${eventId}:${occurrenceStart}`;
+    const attendees = this.rsvps.get(key) ?? new Set<string>();
+    if (attendees.has(userId)) return 'already_rsvped';
+    if (!event.rsvpOpen) throw new StoreError('rsvp_closed', 'RSVPs are closed for this event.');
+    if (event.capacity !== null && attendees.size >= event.capacity) {
+      throw new StoreError('event_full', 'This event has reached capacity.');
+    }
+    attendees.add(userId);
+    this.rsvps.set(key, attendees);
+    return 'rsvped';
+  }
+
+  async cancelEventRsvp(userId: string, eventId: string, occurrenceStart: string): Promise<boolean> {
+    const attendees = this.rsvps.get(`${eventId}:${occurrenceStart}`);
+    return attendees?.delete(userId) ?? false;
+  }
+
+  async listEventAttendees(
+    eventId: string,
+    occurrenceStart: string,
+    limit: number,
+    offset: number,
+  ): Promise<{ event: EventRecord; total: number; attendees: EventAttendee[] }> {
+    const event = this.events.find(item => item.id === eventId);
+    if (!event) throw new StoreError('event_not_found', 'Event not found.');
+    const attendees = [...(this.rsvps.get(`${eventId}:${occurrenceStart}`) ?? [])]
+      .map(userId => [...this.users.values()].find(user => user.id === userId))
+      .filter((user): user is UserRecord => Boolean(user))
+      .map(user => ({ userId: user.id, name: user.name, rsvpAt: new Date().toISOString() }));
+    return { event, total: attendees.length, attendees: attendees.slice(offset, offset + limit) };
+  }
+
+  async searchUsers(query: string, limit: number, offset: number): Promise<{ users: AdminUser[]; total: number }> {
+    const matches = [...this.users.values()]
+      .filter(user => user.name.toLowerCase().includes(query.toLowerCase()) ||
+        user.email.toLowerCase().includes(query.toLowerCase()))
+      .sort((left, right) => left.email.localeCompare(right.email));
+    return {
+      users: matches.slice(offset, offset + limit).map(user => ({
+        ...this.account(user.id),
+        emailVerifiedAt: user.emailVerifiedAt?.toISOString() ?? null,
+      })),
+      total: matches.length,
+    };
+  }
+
+  async getPointsSummary(): Promise<PointsSummary> {
+    const values = [...this.users.values()].map(user => this.balances.get(user.id) ?? 0);
+    return {
+      totalUsers: values.length,
+      usersWithPoints: values.filter(value => value > 0).length,
+      totalPoints: values.reduce((sum, value) => sum + value, 0),
+    };
+  }
+
+  async getUserPoints(
+    userId: string,
+    _limit: number,
+    _offset: number,
+  ): Promise<{ balance: number; entries: PointsLedgerEntry[]; total: number }> {
+    return { balance: this.account(userId).rewardPoints, entries: [], total: 0 };
+  }
+
+  async listAdminEvents(): Promise<EventRecord[]> {
+    return this.events;
+  }
+
+  async listAdminRewards(): Promise<AdminReward[]> {
+    return [...this.adminRewards.values()];
+  }
+
+  async createEvent(actorId: string, input: EventInput): Promise<EventRecord> {
+    if (this.events.some(event => event.id === input.id)) {
+      throw new StoreError('event_conflict', 'An event with this ID already exists.');
+    }
+    const event = { ...input, active: true };
+    this.events.push(event);
+    this.audit.push({ actorId, action: 'event.create', targetId: event.id });
+    return event;
+  }
+
+  async updateEvent(actorId: string, eventId: string, input: EventInput): Promise<EventRecord> {
+    const index = this.events.findIndex(event => event.id === eventId);
+    if (index < 0) throw new StoreError('event_not_found', 'Event not found.');
+    const event = { ...input, active: this.events[index].active };
+    this.events[index] = event;
+    this.audit.push({ actorId, action: 'event.update', targetId: eventId });
+    return event;
+  }
+
+  async archiveEvent(actorId: string, eventId: string): Promise<void> {
+    const event = this.events.find(item => item.id === eventId && item.active);
+    if (!event) throw new StoreError('event_not_found', 'Event not found or already archived.');
+    event.active = false;
+    event.rsvpOpen = false;
+    this.audit.push({ actorId, action: 'event.archive', targetId: eventId });
+  }
+
+  async createReward(actorId: string, reward: Reward): Promise<AdminReward> {
+    if (this.adminRewards.has(reward.id)) {
+      throw new StoreError('reward_conflict', 'A reward with this ID already exists.');
+    }
+    const created = { ...reward, active: true };
+    this.adminRewards.set(created.id, created);
+    this.audit.push({ actorId, action: 'reward.create', targetId: created.id });
+    return created;
+  }
+
+  async updateReward(actorId: string, rewardId: string, reward: Omit<Reward, 'id'>): Promise<AdminReward> {
+    const current = this.adminRewards.get(rewardId);
+    if (!current) throw new StoreError('reward_not_found', 'Reward not found.');
+    const updated = { id: rewardId, ...reward, active: current.active };
+    this.adminRewards.set(rewardId, updated);
+    this.audit.push({ actorId, action: 'reward.update', targetId: rewardId });
+    return updated;
+  }
+
+  async archiveReward(actorId: string, rewardId: string): Promise<void> {
+    const reward = this.adminRewards.get(rewardId);
+    if (!reward || !reward.active) throw new StoreError('reward_not_found', 'Reward not found or already archived.');
+    reward.active = false;
+    this.audit.push({ actorId, action: 'reward.archive', targetId: rewardId });
+  }
+
+  async assignUserRole(actorId: string, userId: string, role: UserRole): Promise<void> {
+    if (actorId === userId) throw new StoreError('self_role_change', 'Admins cannot change their own role.');
+    const user = [...this.users.values()].find(item => item.id === userId);
+    if (!user) throw new StoreError('user_not_found', 'User not found.');
+    if (user.role === 'admin' && role !== 'admin' &&
+      [...this.users.values()].filter(item => item.role === 'admin').length <= 1) {
+      throw new StoreError('last_admin', 'The last admin cannot be demoted.');
+    }
+    const previousRole = user.role;
+    user.role = role;
+    if (previousRole !== role) this.audit.push({ actorId, action: 'user.role_change', targetId: userId });
+  }
+
   private account(userId: string): Account {
     const user = [...this.users.values()].find(item => item.id === userId);
     if (!user) throw new Error('Memory store user not found.');
@@ -151,6 +328,7 @@ class MemoryStore implements Store {
       name: user.name,
       email: user.email,
       rewardPoints: this.balances.get(userId) ?? 0,
+      role: user.role,
     };
   }
 }
@@ -296,4 +474,151 @@ test('cookie session transport requires an allowed browser origin', async () => 
 
 test('token hashes are not the raw session token', () => {
   assert.notEqual(hashOpaqueToken('raw-session-token'), 'raw-session-token');
+});
+
+test('staff and admin routes enforce roles, return limited data, and audit admin writes', async () => {
+  const member = await store.createUser(randomUUID(), 'RBAC Member', 'rbac-member@example.com', 'hash');
+  const staff = await store.createUser(randomUUID(), 'RBAC Staff', 'rbac-staff@example.com', 'hash');
+  const admin = await store.createUser(randomUUID(), 'RBAC Admin', 'rbac-admin@example.com', 'hash');
+  assert.ok(member && staff && admin);
+  staff.role = 'staff';
+  admin.role = 'admin';
+  const credentials = [
+    { userId: member.id, access: 'rbac-member-access' },
+    { userId: staff.id, access: 'rbac-staff-access' },
+    { userId: admin.id, access: 'rbac-admin-access' },
+  ];
+  for (const credential of credentials) {
+    await store.createSession(
+      randomUUID(),
+      credential.userId,
+      hashOpaqueToken(credential.access),
+      hashOpaqueToken(`${credential.access}-refresh`),
+      new Date(Date.now() + 60_000),
+      new Date(Date.now() + 60_000),
+    );
+  }
+  const auth = (token: string) => ({ authorization: `Bearer ${token}` });
+  const memberAuth = auth('rbac-member-access');
+  const staffAuth = auth('rbac-staff-access');
+  const adminAuth = auth('rbac-admin-access');
+
+  assert.equal((await app.inject({ method: 'GET', url: '/api/admin/users?q=rbac' })).statusCode, 401);
+  assert.equal((await app.inject({ method: 'GET', url: '/api/admin/points', headers: memberAuth })).statusCode, 403);
+
+  const search = await app.inject({
+    method: 'GET',
+    url: '/api/admin/users?q=rbac',
+    headers: staffAuth,
+  });
+  assert.equal(search.statusCode, 200);
+  assert.equal(search.json<{ users: unknown[]; total: number }>().total, 3);
+  assert.equal(JSON.stringify(search.json()).includes('passwordHash'), false);
+
+  const rsvp = await app.inject({
+    method: 'POST',
+    url: '/api/events/tasting/rsvp',
+    headers: memberAuth,
+    payload: { occurrenceStart: '2026-11-14T16:00:00.000Z' },
+  });
+  assert.equal(rsvp.statusCode, 201);
+  const attendees = await app.inject({
+    method: 'GET',
+    url: '/api/admin/events/tasting/attendees?occurrenceStart=2026-11-14T16%3A00%3A00.000Z',
+    headers: staffAuth,
+  });
+  assert.equal(attendees.statusCode, 200);
+  const attendeeData = attendees.json<{ attendees: Array<Record<string, unknown>>; total: number }>();
+  assert.equal(attendeeData.total, 1);
+  assert.equal(attendeeData.attendees[0].name, 'RBAC Member');
+  assert.equal('email' in attendeeData.attendees[0], false);
+  assert.equal((await app.inject({ method: 'GET', url: '/api/admin/events', headers: staffAuth })).statusCode, 403);
+
+  const eventInput = {
+    title: 'RBAC test event',
+    startsAt: '2027-01-01T10:00:00Z',
+    description: 'Test event',
+    tag: 'TEST',
+    capacity: 2,
+    rsvpOpen: true,
+    recurrence: 'weekly',
+    recurrenceUntil: null,
+  };
+  const createdEvent = await app.inject({
+    method: 'POST',
+    url: '/api/admin/events',
+    headers: adminAuth,
+    payload: { ...eventInput, id: 'client-controlled-id' },
+  });
+  assert.equal(createdEvent.statusCode, 201);
+  const eventId = createdEvent.json<{ event: EventRecord }>().event.id;
+  assert.notEqual(eventId, 'client-controlled-id');
+  const eventOccurrence = '2027-01-01T10:00:00.000Z';
+  const rsvpCreated = await app.inject({
+    method: 'POST',
+    url: `/api/events/${eventId}/rsvp`,
+    headers: memberAuth,
+    payload: { occurrenceStart: eventOccurrence },
+  });
+  assert.equal(rsvpCreated.statusCode, 201);
+  const separateOccurrence = await app.inject({
+    method: 'POST',
+    url: `/api/events/${eventId}/rsvp`,
+    headers: memberAuth,
+    payload: { occurrenceStart: '2027-01-08T10:00:00.000Z' },
+  });
+  assert.equal(separateOccurrence.statusCode, 201);
+  assert.equal((await app.inject({
+    method: 'POST',
+    url: `/api/admin/events/${eventId}/update`,
+    headers: adminAuth,
+    payload: { ...eventInput, capacity: 1 },
+  })).statusCode, 200);
+  const full = await app.inject({
+    method: 'POST',
+    url: `/api/events/${eventId}/rsvp`,
+    headers: staffAuth,
+    payload: { occurrenceStart: eventOccurrence },
+  });
+  assert.equal(full.statusCode, 409);
+  assert.equal(full.json<{ error: { code: string } }>().error.code, 'event_full');
+
+  const rewardInput = { name: 'RBAC reward', pointsCost: 75, icon: '🎁' };
+  const createdReward = await app.inject({
+    method: 'POST',
+    url: '/api/admin/rewards',
+    headers: adminAuth,
+    payload: { ...rewardInput, id: 'client-controlled-reward' },
+  });
+  assert.equal(createdReward.statusCode, 201);
+  const rewardId = createdReward.json<{ reward: { id: string } }>().reward.id;
+  assert.notEqual(rewardId, 'client-controlled-reward');
+  assert.equal((await app.inject({
+    method: 'POST',
+    url: `/api/admin/rewards/${rewardId}/update`,
+    headers: adminAuth,
+    payload: { ...rewardInput, pointsCost: 90 },
+  })).statusCode, 200);
+  assert.equal((await app.inject({
+    method: 'POST',
+    url: `/api/admin/rewards/${rewardId}/archive`,
+    headers: adminAuth,
+    payload: {},
+  })).statusCode, 200);
+
+  assert.equal((await app.inject({
+    method: 'POST',
+    url: `/api/admin/users/${staff.id}/role`,
+    headers: adminAuth,
+    payload: { role: 'admin' },
+  })).statusCode, 200);
+  assert.equal((await app.inject({
+    method: 'POST',
+    url: `/api/admin/users/${admin.id}/role`,
+    headers: adminAuth,
+    payload: { role: 'staff' },
+  })).statusCode, 409);
+  assert.ok(store.audit.some(entry => entry.action === 'user.role_change'));
+  assert.ok(store.audit.some(entry => entry.action === 'event.create'));
+  assert.ok(store.audit.some(entry => entry.action === 'reward.archive'));
 });

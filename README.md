@@ -78,6 +78,28 @@ migration first with `npm run migrate --prefix server`.
 - Reward balances and redemption eligibility are calculated by the server.
   New accounts begin with zero points. Purchase and administrative point-credit
   workflows are not implemented yet.
+- Staff and admin access is assigned to existing accounts only. Members can
+  RSVP separately to each one-time or recurring event occurrence. Admins can
+  create weekly and monthly series with an optional end date; event times use
+  America/New_York and follow daylight-saving changes. Staff can search
+  accounts, view attendee names and RSVP times,
+  and review points reports. Admins can also manage events and rewards and
+  assign roles. Point adjustment and account suspension are not available.
+- To provision the first admin, connect to PostgreSQL with an authorized
+  database administrator and promote a verified account:
+
+  ```sql
+  UPDATE users
+  SET role = 'admin'
+  WHERE email = lower('admin@example.com')
+    AND email_verified_at IS NOT NULL
+  RETURNING id, email, role;
+  ```
+
+  Confirm that exactly one intended account was updated, then provision at
+  least one additional admin to avoid lockout. Do not expose role assignment
+  through public registration. Subsequent role changes and other admin writes
+  are recorded in `admin_audit_log`.
 - Local prototype accounts are not migrated; users register through the API.
 - Development Compose credentials and the development token-hash secret are for
   local use only. Production must use managed PostgreSQL, HTTPS, a strong

@@ -10,8 +10,11 @@ import {
   restoreActiveAccount, signIn, signOut, verifyEmail,
 } from './auth';
 import { fetchRewards, redeemReward as submitRewardRedemption, Reward } from './rewardsApi';
+import StaffDashboard from './StaffDashboard';
+import { cancelEventRsvp, fetchEvents, rsvpToEvent, type AppEvent } from './eventsApi';
+import { EVENT_TIME_ZONE } from './easternDateTime';
 
-type Tab = 'Events' | 'Menu' | 'Rewards';
+type Tab = 'Events' | 'Menu' | 'Rewards' | 'Staff';
 type Category = 'All' | 'Food' | 'Drinks';
 type AuthMode = 'login' | 'signup' | 'verify' | 'forgot' | 'reset';
 
@@ -19,14 +22,6 @@ const tabs: { name: Tab; icon: string }[] = [
   { name: 'Events', icon: '◷' },
   { name: 'Menu', icon: '☷' },
   { name: 'Rewards', icon: '☆' },
-];
-const events = [
-  { id: 'tasting', day: '14', month: 'NOV', title: 'A taste of the season',
-    detail: 'Saturday, Nov 14, 2026 · 11 AM–1 PM', description: 'Meet our seasonal favorites with a tasting made for our members.', tag: 'MEMBER EXCLUSIVE', icon: '🥐' },
-  { id: 'coffee', day: '21', month: 'NOV', title: 'Coffee & good company',
-    detail: 'Saturday, Nov 21, 2026 · 9–11 AM', description: 'Discover your new favorite brew at a relaxed coffee workshop.', tag: 'COMMUNITY', icon: '☕' },
-  { id: 'supper', day: '28', month: 'NOV', title: 'The neighborhood table',
-    detail: 'Saturday, Nov 28, 2026 · 5–7 PM', description: 'Come together for a cozy evening of fresh food and friendly faces.', tag: 'IN STORE', icon: '🥗' },
 ];
 const menu = [
   { id: 'bowl', name: 'Harvest bowl', description: 'Roasted vegetables, quinoa, greens & lemon tahini.', price: '$12.50', category: 'Food', icon: '🥗' },
@@ -366,7 +361,9 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
 function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => Promise<void> }) {
   const [tab, setTab] = useState<Tab>('Events');
   const [category, setCategory] = useState<Category>('All');
-  const [reservations, setReservations] = useState<string[]>([]);
+  const [events, setEvents] = useState<AppEvent[]>([]);
+  const [loadingEvents, setLoadingEvents] = useState(true);
+  const [rsvpPendingId, setRsvpPendingId] = useState<string | null>(null);
   const [points, setPoints] = useState(account.rewardPoints);
   const [rewards, setRewards] = useState<Reward[]>([]);
   const [loadingRewards, setLoadingRewards] = useState(true);
@@ -375,6 +372,20 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
   const [notice, setNotice] = useState('');
   const [redeeming, setRedeeming] = useState(false);
   const [redemptionRequest, setRedemptionRequest] = useState<{ rewardId: string; key: string } | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    if (tab !== 'Events') return () => { active = false; };
+    setLoadingEvents(true);
+    fetchEvents()
+      .then(items => { if (active) setEvents(items); })
+      .catch(error => {
+        console.error('Unable to load events from the API.', error);
+        if (active) setNotice(error instanceof ApiError ? error.message : 'We could not load events. Please try again later.');
+      })
+      .finally(() => { if (active) setLoadingEvents(false); });
+    return () => { active = false; };
+  }, [tab]);
 
   useEffect(() => {
     let active = true;
@@ -394,10 +405,21 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
     };
   }, []);
 
-  function toggleReservation(id: string) {
-    const reserved = reservations.includes(id);
-    setReservations(current => reserved ? current.filter(item => item !== id) : [...current, id]);
-    setNotice(reserved ? 'Demo reservation canceled.' : 'You’re on the demo guest list! No real booking was made.');
+  async function toggleReservation(event: AppEvent) {
+    const occurrenceKey = `${event.id}:${event.occurrenceStart}`;
+    setRsvpPendingId(occurrenceKey);
+    setNotice('');
+    try {
+      if (event.reserved) await cancelEventRsvp(event.id, event.occurrenceStart);
+      else await rsvpToEvent(event.id, event.occurrenceStart);
+      setEvents(await fetchEvents());
+      setNotice(event.reserved ? 'Your RSVP was canceled.' : 'You’re on the guest list!');
+    } catch (error) {
+      console.error('Unable to update the event RSVP.', error);
+      setNotice(error instanceof ApiError ? error.message : 'We could not update your RSVP. Please try again.');
+    } finally {
+      setRsvpPendingId(null);
+    }
   }
 
   async function redeemReward() {
@@ -424,6 +446,10 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
       setRedeeming(false);
     }
   }
+
+  const visibleTabs = account.role === 'member'
+    ? tabs
+    : [...tabs, { name: 'Staff' as const, icon: '⚙' }];
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -456,10 +482,15 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
         <ScrollView key={tab} contentContainerStyle={styles.content}>
           <Text style={styles.eyebrow}>YOUR NEIGHBORHOOD, REWARDED</Text>
           <Text accessibilityRole="header" style={styles.title}>
-            {tab === 'Events' ? 'Good things are happening.' : tab === 'Menu' ? 'Fresh favorites, made for you.' : 'A little thank you, from us.'}
+            {tab === 'Events' ? 'Good things are happening.'
+              : tab === 'Menu' ? 'Fresh favorites, made for you.'
+                : tab === 'Rewards' ? 'A little thank you, from us.' : 'Staff workspace.'}
           </Text>
           <Text style={styles.subtitle}>
-            {tab === 'Events' ? 'Pull up a chair. There’s always something to look forward to.' : tab === 'Menu' ? 'Simple ingredients. Thoughtful flavors. Find your next favorite.' : 'Every visit brings you closer to something delicious.'}
+            {tab === 'Events' ? 'Pull up a chair. There’s always something to look forward to.'
+              : tab === 'Menu' ? 'Simple ingredients. Thoughtful flavors. Find your next favorite.'
+                : tab === 'Rewards' ? 'Every visit brings you closer to something delicious.'
+                  : 'Member support, event operations, and program reporting.'}
           </Text>
 
           {notice !== '' && (
@@ -482,28 +513,48 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
                 <Text accessibilityRole="header" style={styles.sectionTitle}>Upcoming events</Text>
                 <Text style={styles.muted}>{events.length} to look forward to</Text>
               </View>
+              {loadingEvents && <ActivityIndicator color="#234D38" />}
+              {!loadingEvents && events.length === 0 && <Text style={styles.muted}>No upcoming events are available right now.</Text>}
               {events.map(event => {
-                const reserved = reservations.includes(event.id);
+                const reserved = event.reserved;
+                const startsAt = new Date(event.startsAt);
+                const month = startsAt.toLocaleString('en-US', { month: 'short', timeZone: EVENT_TIME_ZONE }).toUpperCase();
+                const day = startsAt.toLocaleString('en-US', { day: 'numeric', timeZone: EVENT_TIME_ZONE });
+                const date = startsAt.toLocaleDateString('en-US', {
+                  weekday: 'long', month: 'short', day: 'numeric', year: 'numeric', timeZone: EVENT_TIME_ZONE,
+                });
+                const time = startsAt.toLocaleTimeString('en-US', {
+                  hour: 'numeric', minute: '2-digit', timeZone: EVENT_TIME_ZONE, timeZoneName: 'short',
+                });
+                const occurrenceKey = `${event.id}:${event.occurrenceStart}`;
+                const full = event.capacity !== null && event.attendeeCount >= event.capacity && !reserved;
+                const closed = !event.rsvpOpen && !reserved;
                 return (
-                  <View key={event.id} style={styles.card}>
+                  <View key={occurrenceKey} style={styles.card}>
                     <View style={styles.eventTop}>
                       <View style={styles.dateBadge}>
-                        <Text style={styles.dateMonth}>{event.month}</Text>
-                        <Text style={styles.dateDay}>{event.day}</Text>
+                        <Text style={styles.dateMonth}>{month}</Text>
+                        <Text style={styles.dateDay}>{day}</Text>
                       </View>
                       <Text style={styles.tag}>{event.tag}</Text>
-                      <Text style={styles.eventIcon} accessible={false}>{event.icon}</Text>
                     </View>
                     <Text accessibilityRole="header" style={styles.cardTitle}>{event.title}</Text>
-                    <Text style={styles.eventTime}>{event.detail}</Text>
+                    <Text style={styles.eventTime}>{date} · {time}</Text>
+                    {event.recurrence !== 'none' && (
+                      <Text style={styles.muted}>Part of a {event.recurrence} series · RSVP for this date</Text>
+                    )}
                     <Text style={styles.description}>{event.description}</Text>
                     <Pressable
                       accessibilityRole="button"
-                      accessibilityLabel={`${reserved ? 'Cancel reservation for' : 'RSVP to'} ${event.title}`}
-                      onPress={() => toggleReservation(event.id)}
-                      style={({ pressed }) => [styles.button, reserved && styles.secondaryButton, pressed && styles.pressed]}
+                      accessibilityLabel={`${reserved ? 'Cancel reservation for' : 'RSVP to'} ${event.title} on ${date}`}
+                      accessibilityState={{ disabled: rsvpPendingId === occurrenceKey || closed || full }}
+                      disabled={rsvpPendingId === occurrenceKey || closed || full}
+                      onPress={() => void toggleReservation(event)}
+                      style={({ pressed }) => [styles.button, (reserved || closed || full) && styles.secondaryButton, pressed && styles.pressed]}
                     >
-                      <Text style={[styles.buttonText, reserved && styles.secondaryButtonText]}>{reserved ? 'You’re going · Cancel RSVP' : 'Count me in  →'}</Text>
+                      <Text style={[styles.buttonText, (reserved || closed || full) && styles.secondaryButtonText]}>
+                        {reserved ? 'You’re going · Cancel RSVP' : closed ? 'RSVPs closed' : full ? 'Event is full' : 'Count me in  →'}
+                      </Text>
                     </Pressable>
                   </View>
                 );
@@ -578,11 +629,12 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
               </View>
             </>
           )}
-          <Text style={styles.footnote}>Sample events, menu, and rewards.{'\n'}Account, points, and redemptions are server-managed; RSVPs reset on reload.</Text>
+          {tab === 'Staff' && account.role !== 'member' && <StaffDashboard account={account} />}
+          <Text style={styles.footnote}>Sample menu.{'\n'}Accounts, events, rewards, points, redemptions, and RSVPs are server-managed.</Text>
         </ScrollView>
 
         <View accessibilityRole="tablist" style={styles.tabBar}>
-          {tabs.map(item => (
+          {visibleTabs.map(item => (
             <Pressable key={item.name} accessibilityRole="tab" accessibilityState={{ selected: tab === item.name }}
               onPress={() => { setTab(item.name); setNotice(''); }}
               style={({ pressed }) => [styles.tab, tab === item.name && styles.activeTab, pressed && styles.pressed]}>

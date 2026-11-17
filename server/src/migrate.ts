@@ -6,6 +6,11 @@ import { readConfig } from './config.js';
 
 const config = readConfig();
 const pool = new Pool({ connectionString: config.databaseUrl });
+const migrations = [
+  ['001_initial', '001_initial.sql'],
+  ['002_rbac_events', '002_rbac_events.sql'],
+  ['003_recurring_events', '003_recurring_events.sql'],
+] as const;
 
 try {
   const client = await pool.connect();
@@ -17,14 +22,16 @@ try {
          applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
        )`,
     );
-    const applied = await client.query(
-      'SELECT version FROM schema_migrations WHERE version = $1',
-      ['001_initial'],
-    );
-    if (applied.rowCount === 0) {
-      const migration = await readFile(resolve(process.cwd(), 'migrations', '001_initial.sql'), 'utf8');
-      await client.query(migration);
-      await client.query('INSERT INTO schema_migrations (version) VALUES ($1)', ['001_initial']);
+    for (const [version, filename] of migrations) {
+      const applied = await client.query(
+        'SELECT version FROM schema_migrations WHERE version = $1',
+        [version],
+      );
+      if (applied.rowCount === 0) {
+        const migration = await readFile(resolve(process.cwd(), 'migrations', filename), 'utf8');
+        await client.query(migration);
+        await client.query('INSERT INTO schema_migrations (version) VALUES ($1)', [version]);
+      }
     }
     await client.query('COMMIT');
     console.info('Database migrations are up to date.');

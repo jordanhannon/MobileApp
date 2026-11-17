@@ -2,7 +2,8 @@ import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
-import type { Account } from './domain.js';
+import type { Account, EventInput, Reward, UserRole } from './domain.js';
+import { StoreError } from './domain.js';
 import {
   createEmailCode, createId, createOpaqueToken, hashEmailCode, hashOpaqueToken, hashPassword, normalizeEmail, verifyPassword,
 } from './crypto.js';
@@ -62,6 +63,123 @@ function emailField(body: Record<string, unknown>): string {
 function passwordField(body: Record<string, unknown>, key = 'password'): string {
   const password = stringField(body, key, 8, 128);
   return password;
+}
+
+function roleField(body: Record<string, unknown>): UserRole {
+  const role = body.role;
+  if (role !== 'member' && role !== 'staff' && role !== 'admin') {
+    throw new ApiError(400, 'invalid_request', 'Invalid role.');
+  }
+  return role;
+}
+
+function routeParameter(request: FastifyRequest, key: string, maxLength = 100): string {
+  const params = bodyRecord(request.params);
+  return stringField(params, key, 1, maxLength);
+}
+
+function slugParameter(value: string): string {
+  const slug = value.toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{1,79}$/.test(slug)) {
+    throw new ApiError(400, 'invalid_request', 'Invalid identifier.');
+  }
+  return slug;
+}
+
+function uuidParameter(value: string): string {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw new ApiError(400, 'invalid_request', 'Invalid user ID.');
+  }
+  return value;
+}
+
+function pagination(request: FastifyRequest): { page: number; limit: number; offset: number } {
+  const query = bodyRecord(request.query);
+  const parse = (key: string, fallback: number, max: number): number => {
+    const raw = query[key];
+    if (raw === undefined) return fallback;
+    const value = typeof raw === 'string' ? Number(raw) : raw;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > max) {
+      throw new ApiError(400, 'invalid_request', `Invalid ${key}.`);
+    }
+    return value;
+  };
+  const page = parse('page', 1, 100000);
+  const limit = parse('pageSize', 25, 100);
+  return { page, limit, offset: (page - 1) * limit };
+}
+
+function dateInEasternTime(date: Date): string {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date).map(part => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function eventInput(body: Record<string, unknown>, id: string): EventInput {
+  const startsAtInput = stringField(body, 'startsAt', 1, 40);
+  const startsAt = new Date(startsAtInput);
+  const capacity = body.capacity;
+  const recurrence = body.recurrence;
+  const recurrenceUntil = body.recurrenceUntil;
+  if (!/(Z|[+-]\d{2}:\d{2})$/i.test(startsAtInput) || !Number.isFinite(startsAt.getTime())) {
+    throw new ApiError(400, 'invalid_request', 'Event start time must include a valid time zone.');
+  }
+  if (
+    capacity !== null &&
+    (typeof capacity !== 'number' || !Number.isInteger(capacity) || capacity < 1 || capacity > 100000)
+  ) {
+    throw new ApiError(400, 'invalid_request', 'Invalid capacity.');
+  }
+  if (typeof body.rsvpOpen !== 'boolean') {
+    throw new ApiError(400, 'invalid_request', 'Invalid RSVP status.');
+  }
+  if (recurrence !== 'none' && recurrence !== 'weekly' && recurrence !== 'monthly') {
+    throw new ApiError(400, 'invalid_request', 'Invalid event recurrence.');
+  }
+  if (
+    recurrenceUntil !== null &&
+    (typeof recurrenceUntil !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(recurrenceUntil) ||
+      !Number.isFinite(Date.parse(`${recurrenceUntil}T00:00:00Z`)) ||
+      new Date(`${recurrenceUntil}T00:00:00Z`).toISOString().slice(0, 10) !== recurrenceUntil)
+  ) {
+    throw new ApiError(400, 'invalid_request', 'Invalid recurrence end date.');
+  }
+  if (recurrence === 'none' && recurrenceUntil !== null) {
+    throw new ApiError(400, 'invalid_request', 'A one-time event cannot have a recurrence end date.');
+  }
+  if (recurrence !== 'none' && typeof recurrenceUntil === 'string' &&
+    recurrenceUntil < dateInEasternTime(startsAt)) {
+    throw new ApiError(400, 'invalid_request', 'The recurrence end date must be on or after the event date.');
+  }
+  return {
+    id,
+    title: stringField(body, 'title', 1, 120).trim(),
+    startsAt: startsAt.toISOString(),
+    description: stringField(body, 'description', 1, 2000).trim(),
+    tag: stringField(body, 'tag', 1, 60).trim(),
+    capacity,
+    rsvpOpen: body.rsvpOpen,
+    recurrence,
+    recurrenceUntil,
+  };
+}
+
+function rewardInput(body: Record<string, unknown>, id?: string): Reward {
+  const pointsCost = body.pointsCost;
+  if (typeof pointsCost !== 'number' || !Number.isInteger(pointsCost) || pointsCost < 1 || pointsCost > 1000000) {
+    throw new ApiError(400, 'invalid_request', 'Invalid reward point cost.');
+  }
+  const rewardId = slugParameter(id ?? createId());
+  return {
+    id: rewardId,
+    name: stringField(body, 'name', 1, 120).trim(),
+    pointsCost,
+    icon: stringField(body, 'icon', 1, 16),
+  };
 }
 
 function nativeTransport(request: FastifyRequest): boolean {
@@ -142,6 +260,17 @@ export function createApp({ config, store, emailSender }: AppDependencies) {
     }
   };
 
+  const requireRole = (...roles: UserRole[]) => async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<void> => {
+    await requireAccount(request, reply);
+    if (reply.sent || !request.account) return;
+    if (!roles.includes(request.account.role)) {
+      reply.code(403).send({ error: { code: 'forbidden', message: 'You do not have permission to do that.' } });
+    }
+  };
+
   async function sendEmailCode(userId: string, email: string, purpose: 'verify_email' | 'reset_password') {
     const code = createEmailCode();
     await store.issueEmailToken(
@@ -179,6 +308,15 @@ export function createApp({ config, store, emailSender }: AppDependencies) {
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ApiError) {
       reply.code(error.status).send({ error: { code: error.code, message: error.message } });
+      return;
+    }
+    if (error instanceof StoreError) {
+      const status = error.code.endsWith('_not_found') ? 404
+        : error.code === 'rsvp_closed' || error.code === 'event_full' ||
+          error.code === 'capacity_below_attendance' || error.code === 'last_admin' ||
+          error.code === 'self_role_change' || error.code.endsWith('_conflict') ? 409
+          : 400;
+      reply.code(status).send({ error: { code: error.code, message: error.message } });
       return;
     }
     if (
@@ -292,6 +430,128 @@ export function createApp({ config, store, emailSender }: AppDependencies) {
   });
 
   app.get('/api/rewards', { preHandler: requireAccount }, async () => ({ rewards: await store.listRewards() }));
+
+  app.get('/api/events', { preHandler: requireAccount }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    return { events: await store.listEvents(request.account.id) };
+  });
+
+  app.post('/api/events/:eventId/rsvp', { preHandler: requireAccount }, async (request, reply) => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const eventId = slugParameter(routeParameter(request, 'eventId', 80));
+    const body = bodyRecord(request.body);
+    const occurrenceStart = new Date(stringField(body, 'occurrenceStart', 1, 40));
+    if (!Number.isFinite(occurrenceStart.getTime())) {
+      throw new ApiError(400, 'invalid_request', 'Invalid event occurrence.');
+    }
+    const result = await store.rsvpToEvent(request.account.id, eventId, occurrenceStart.toISOString());
+    return reply.code(result === 'rsvped' ? 201 : 200).send({ rsvped: true, alreadyApplied: result === 'already_rsvped' });
+  });
+
+  app.post('/api/events/:eventId/cancel', { preHandler: requireAccount }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const eventId = slugParameter(routeParameter(request, 'eventId', 80));
+    const body = bodyRecord(request.body);
+    const occurrenceStart = new Date(stringField(body, 'occurrenceStart', 1, 40));
+    if (!Number.isFinite(occurrenceStart.getTime())) {
+      throw new ApiError(400, 'invalid_request', 'Invalid event occurrence.');
+    }
+    return {
+      cancelled: await store.cancelEventRsvp(request.account.id, eventId, occurrenceStart.toISOString()),
+    };
+  });
+
+  app.get('/api/admin/users', { preHandler: requireRole('staff', 'admin') }, async request => {
+    const query = bodyRecord(request.query);
+    const search = typeof query.q === 'string' ? query.q.trim() : '';
+    if (search.length < 2 || search.length > 200) {
+      throw new ApiError(400, 'invalid_request', 'Search text must be between 2 and 200 characters.');
+    }
+    const page = pagination(request);
+    const result = await store.searchUsers(search, page.limit, page.offset);
+    return { ...result, page: page.page, pageSize: page.limit };
+  });
+
+  app.get('/api/admin/points', { preHandler: requireRole('staff', 'admin') }, async () => ({
+    summary: await store.getPointsSummary(),
+  }));
+
+  app.get('/api/admin/users/:userId/points', { preHandler: requireRole('staff', 'admin') }, async request => {
+    const userId = uuidParameter(routeParameter(request, 'userId', 36));
+    const page = pagination(request);
+    return { ...(await store.getUserPoints(userId, page.limit, page.offset)), page: page.page, pageSize: page.limit };
+  });
+
+  app.get('/api/admin/events/:eventId/attendees', { preHandler: requireRole('staff', 'admin') }, async request => {
+    const eventId = slugParameter(routeParameter(request, 'eventId', 80));
+    const query = bodyRecord(request.query);
+    const occurrenceStart = new Date(stringField(query, 'occurrenceStart', 1, 40));
+    if (!Number.isFinite(occurrenceStart.getTime())) {
+      throw new ApiError(400, 'invalid_request', 'Invalid event occurrence.');
+    }
+    const page = pagination(request);
+    return {
+      ...(await store.listEventAttendees(eventId, occurrenceStart.toISOString(), page.limit, page.offset)),
+      page: page.page,
+      pageSize: page.limit,
+    };
+  });
+
+  app.get('/api/admin/events', { preHandler: requireRole('admin') }, async () => ({
+    events: await store.listAdminEvents(),
+  }));
+
+  app.post('/api/admin/events', { preHandler: requireRole('admin') }, async (request, reply) => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const body = bodyRecord(request.body);
+    const id = createId();
+    const event = await store.createEvent(request.account.id, eventInput(body, id));
+    return reply.code(201).send({ event });
+  });
+
+  app.post('/api/admin/events/:eventId/update', { preHandler: requireRole('admin') }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const eventId = slugParameter(routeParameter(request, 'eventId', 80));
+    return { event: await store.updateEvent(request.account.id, eventId, eventInput(bodyRecord(request.body), eventId)) };
+  });
+
+  app.post('/api/admin/events/:eventId/archive', { preHandler: requireRole('admin') }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const eventId = slugParameter(routeParameter(request, 'eventId', 80));
+    await store.archiveEvent(request.account.id, eventId);
+    return { archived: true };
+  });
+
+  app.get('/api/admin/rewards', { preHandler: requireRole('admin') }, async () => ({
+    rewards: await store.listAdminRewards(),
+  }));
+
+  app.post('/api/admin/rewards', { preHandler: requireRole('admin') }, async (request, reply) => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const reward = await store.createReward(request.account.id, rewardInput(bodyRecord(request.body)));
+    return reply.code(201).send({ reward });
+  });
+
+  app.post('/api/admin/rewards/:rewardId/update', { preHandler: requireRole('admin') }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const rewardId = slugParameter(routeParameter(request, 'rewardId', 80));
+    const reward = rewardInput(bodyRecord(request.body), rewardId);
+    return { reward: await store.updateReward(request.account.id, rewardId, reward) };
+  });
+
+  app.post('/api/admin/rewards/:rewardId/archive', { preHandler: requireRole('admin') }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const rewardId = slugParameter(routeParameter(request, 'rewardId', 80));
+    await store.archiveReward(request.account.id, rewardId);
+    return { archived: true };
+  });
+
+  app.post('/api/admin/users/:userId/role', { preHandler: requireRole('admin') }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const userId = uuidParameter(routeParameter(request, 'userId', 36));
+    await store.assignUserRole(request.account.id, userId, roleField(bodyRecord(request.body)));
+    return { updated: true };
+  });
 
   app.post('/api/redemptions', { preHandler: requireAccount }, async (request, reply) => {
     if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');

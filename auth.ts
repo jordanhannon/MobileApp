@@ -6,6 +6,7 @@ export type Account = {
   name: string;
   email: string;
   rewardPoints: number;
+  role: 'member' | 'staff' | 'admin';
 };
 
 type SessionResponse = {
