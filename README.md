@@ -107,14 +107,17 @@ migration first with `npm run migrate --prefix server`.
   New accounts begin with zero points. Purchase and administrative point-credit
   workflows are not implemented yet.
 - Staff and admin access is assigned to existing accounts only. Members can
-  RSVP separately to each one-time or recurring event occurrence. Admins can
-  create weekly and monthly series with an optional end date; event times use
-  America/New_York and follow daylight-saving changes. Staff can search
-  accounts, view attendee names and RSVP times,
-  and review points reports. Admins can also manage events and rewards and
-  assign roles. Point adjustment and account suspension are not available.
-- Admins can enable tournament brackets per event series; the setting defaults
-  off. For enabled series, each occurrence accepts member RSVPs and staff-entered
+  RSVP separately to each one-time or recurring event occurrence. Staff and
+  admins can create, edit, and archive events, including weekly and monthly
+  series with an optional end date; event times use America/New_York and follow
+  daylight-saving changes. The start time and recurrence can be changed before
+  participants register. After RSVPs or bracket guests exist, archive the
+  series and create a replacement to reschedule it. Staff can also search
+  accounts, view attendee names and RSVP times, and review points reports.
+  Admins additionally manage rewards and assign roles. Point adjustment and
+  account suspension are not available.
+- Staff and admins can enable tournament brackets per event series; the setting
+  defaults off. For enabled series, each occurrence accepts member RSVPs and staff-entered
   guest players until its scheduled start, regardless of the series-wide RSVP
   toggle. Guests count toward capacity and the bracket roster. A server-side
   sweep, with request-time catch-up, freezes the roster and randomizes the
@@ -142,8 +145,8 @@ migration first with `npm run migrate --prefix server`.
 
   Confirm that exactly one intended account was updated, then provision at
   least one additional admin to avoid lockout. Do not expose role assignment
-  through public registration. Subsequent role changes and other admin writes
-  are recorded in `admin_audit_log`.
+  through public registration.   Event-management changes by staff or admins, role changes, and other
+  privileged writes are recorded in `admin_audit_log`.
 - Local prototype accounts are not migrated; users register through the API.
 - Development Compose credentials and the development token-hash secret are for
   local use only. Production must use managed PostgreSQL, HTTPS, a strong

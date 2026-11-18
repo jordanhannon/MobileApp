@@ -12,7 +12,7 @@ import {
 } from './adminApi';
 import { fetchEvents, type AppEvent } from './eventsApi';
 
-type Section = 'Users' | 'RSVPs' | 'Points' | 'Manage';
+type Section = 'Users' | 'RSVPs' | 'Points' | 'Events' | 'Manage';
 type EventDraft = Omit<ManagedEventInput, 'capacity' | 'recurrenceUntil'> & {
   capacity: string;
   recurrenceUntil: string;
@@ -39,7 +39,9 @@ function eventKey(event: AppEvent): string {
 
 export default function StaffDashboard({ account }: { account: Account }) {
   const isAdmin = account.role === 'admin';
-  const sections: Section[] = isAdmin ? ['Users', 'RSVPs', 'Points', 'Manage'] : ['Users', 'RSVPs', 'Points'];
+  const sections: Section[] = isAdmin
+    ? ['Users', 'RSVPs', 'Points', 'Manage']
+    : ['Users', 'RSVPs', 'Points', 'Events'];
   const [section, setSection] = useState<Section>('Users');
   const [query, setQuery] = useState('');
   const [users, setUsers] = useState<StaffUser[]>([]);
@@ -103,13 +105,17 @@ export default function StaffDashboard({ account }: { account: Account }) {
   }, [selectedEventKey, section, events]);
 
   useEffect(() => {
-    if (section !== 'Manage' || !isAdmin) return;
+    if (section !== 'Events' && section !== 'Manage') return;
+    if (section === 'Manage' && !isAdmin) return;
     let active = true;
-    Promise.all([fetchManagedEvents(), fetchManagedRewards()])
+    Promise.all([
+      fetchManagedEvents(),
+      isAdmin && section === 'Manage' ? fetchManagedRewards() : Promise.resolve([]),
+    ])
       .then(([eventResult, rewardResult]) => {
         if (active) {
           setManagedEvents(eventResult);
-          setManagedRewards(rewardResult);
+          if (isAdmin && section === 'Manage') setManagedRewards(rewardResult);
         }
       })
       .catch(caught => { if (active) showError(caught, 'Unable to load management data.'); });
@@ -276,7 +282,11 @@ export default function StaffDashboard({ account }: { account: Account }) {
   return (
     <View style={styles.container}>
       <Text style={styles.heading}>Staff workspace</Text>
-      <Text style={styles.muted}>Signed in as {account.role}. Staff reports are read-only.</Text>
+      <Text style={styles.muted}>
+        {isAdmin
+          ? 'Manage events, rewards, and roles; staff reports are read-only.'
+          : 'Manage events, review attendees, and view read-only reports.'}
+      </Text>
       <View style={styles.sectionBar}>
         {sections.map(item => (
           <Pressable
@@ -394,7 +404,7 @@ export default function StaffDashboard({ account }: { account: Account }) {
         </View>
       )}
 
-      {section === 'Manage' && isAdmin && (
+      {(section === 'Events' || (section === 'Manage' && isAdmin)) && (
         <>
           <View style={styles.panel}>
             <Text style={styles.subheading}>{editingEventId ? 'Edit event' : 'Create event'}</Text>
@@ -404,6 +414,9 @@ export default function StaffDashboard({ account }: { account: Account }) {
               value={eventDraft.startsAt}
               onChange={startsAt => setEventDraft(current => ({ ...current, startsAt }))}
             />
+            <Text style={styles.muted}>
+              The start time and recurrence can be changed before participants register. Once RSVPs or bracket guests exist, archive the series and create a replacement to reschedule it.
+            </Text>
             <Field label="Description" value={eventDraft.description} multiline onChangeText={description => setEventDraft(current => ({ ...current, description }))} />
             <Field label="Tag" value={eventDraft.tag} onChangeText={tag => setEventDraft(current => ({ ...current, tag }))} />
             <Field label="Capacity (blank for unlimited)" value={eventDraft.capacity} keyboardType="numeric" onChangeText={capacity => setEventDraft(current => ({ ...current, capacity }))} />
@@ -478,29 +491,33 @@ export default function StaffDashboard({ account }: { account: Account }) {
               </View>
             ))}
           </View>
-          <View style={styles.panel}>
-            <Text style={styles.subheading}>{editingRewardId ? 'Edit reward' : 'Create reward'}</Text>
-            <Field label="Reward name" value={rewardDraft.name} onChangeText={name => setRewardDraft(current => ({ ...current, name }))} />
-            <Field label="Point cost" value={String(rewardDraft.pointsCost)} keyboardType="numeric" onChangeText={value => setRewardDraft(current => ({ ...current, pointsCost: Number(value) }))} />
-            <Field label="Icon" value={rewardDraft.icon} onChangeText={icon => setRewardDraft(current => ({ ...current, icon }))} />
-            <ActionButton label={editingRewardId ? 'Save reward' : 'Create reward'} disabled={pending} onPress={() => void saveReward()} />
-            {editingRewardId !== '' && <ActionButton label="Cancel edit" onPress={() => { setEditingRewardId(''); setRewardDraft(emptyReward); }} />}
-          </View>
-          <View style={styles.panel}>
-            <Text style={styles.subheading}>Manage rewards</Text>
-            {managedRewards.map(reward => (
-              <View key={reward.id} style={styles.card}>
-                <Text style={styles.cardTitle}>{reward.icon} {reward.name} · {reward.pointsCost} points</Text>
-                <Text style={styles.muted}>{reward.active ? 'Active' : 'Archived'}</Text>
-                {reward.active && (
-                  <View style={styles.inlineActions}>
-                    <ActionButton label="Edit" disabled={pending} onPress={() => editReward(reward)} />
-                    <ActionButton label="Archive" disabled={pending} onPress={() => void removeReward(reward)} />
-                  </View>
-                )}
+          {isAdmin && section === 'Manage' && (
+            <>
+              <View style={styles.panel}>
+                <Text style={styles.subheading}>{editingRewardId ? 'Edit reward' : 'Create reward'}</Text>
+                <Field label="Reward name" value={rewardDraft.name} onChangeText={name => setRewardDraft(current => ({ ...current, name }))} />
+                <Field label="Point cost" value={String(rewardDraft.pointsCost)} keyboardType="numeric" onChangeText={value => setRewardDraft(current => ({ ...current, pointsCost: Number(value) }))} />
+                <Field label="Icon" value={rewardDraft.icon} onChangeText={icon => setRewardDraft(current => ({ ...current, icon }))} />
+                <ActionButton label={editingRewardId ? 'Save reward' : 'Create reward'} disabled={pending} onPress={() => void saveReward()} />
+                {editingRewardId !== '' && <ActionButton label="Cancel edit" onPress={() => { setEditingRewardId(''); setRewardDraft(emptyReward); }} />}
               </View>
-            ))}
-          </View>
+              <View style={styles.panel}>
+                <Text style={styles.subheading}>Manage rewards</Text>
+                {managedRewards.map(reward => (
+                  <View key={reward.id} style={styles.card}>
+                    <Text style={styles.cardTitle}>{reward.icon} {reward.name} · {reward.pointsCost} points</Text>
+                    <Text style={styles.muted}>{reward.active ? 'Active' : 'Archived'}</Text>
+                    {reward.active && (
+                      <View style={styles.inlineActions}>
+                        <ActionButton label="Edit" disabled={pending} onPress={() => editReward(reward)} />
+                        <ActionButton label="Archive" disabled={pending} onPress={() => void removeReward(reward)} />
+                      </View>
+                    )}
+                  </View>
+                ))}
+              </View>
+            </>
+          )}
         </>
       )}
     </View>

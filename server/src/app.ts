@@ -678,11 +678,11 @@ export function createApp({ config, store, emailSender, socialTokenVerifier = ne
     };
   });
 
-  app.get('/api/admin/events', { preHandler: requireRole('admin') }, async () => ({
+  app.get('/api/admin/events', { preHandler: requireRole('staff', 'admin') }, async () => ({
     events: await store.listAdminEvents(),
   }));
 
-  app.post('/api/admin/events', { preHandler: requireRole('admin') }, async (request, reply) => {
+  app.post('/api/admin/events', { preHandler: requireRole('staff', 'admin') }, async (request, reply) => {
     if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
     const body = bodyRecord(request.body);
     const id = createId();
@@ -690,13 +690,13 @@ export function createApp({ config, store, emailSender, socialTokenVerifier = ne
     return reply.code(201).send({ event });
   });
 
-  app.post('/api/admin/events/:eventId/update', { preHandler: requireRole('admin') }, async request => {
+  app.post('/api/admin/events/:eventId/update', { preHandler: requireRole('staff', 'admin') }, async request => {
     if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
     const eventId = slugParameter(routeParameter(request, 'eventId', 80));
     return { event: await store.updateEvent(request.account.id, eventId, eventInput(bodyRecord(request.body), eventId)) };
   });
 
-  app.post('/api/admin/events/:eventId/archive', { preHandler: requireRole('admin') }, async request => {
+  app.post('/api/admin/events/:eventId/archive', { preHandler: requireRole('staff', 'admin') }, async request => {
     if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
     const eventId = slugParameter(routeParameter(request, 'eventId', 80));
     await store.archiveEvent(request.account.id, eventId);

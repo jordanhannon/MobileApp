@@ -1592,7 +1592,7 @@ export class PostgresStore implements Store {
           current.recurrence_until !== input.recurrenceUntil)) {
         throw new StoreError(
           'event_schedule_conflict',
-          'The event schedule cannot change after attendees have RSVP’d. Archive this series and create a new one.',
+          'The event schedule cannot change after attendees or bracket guests have registered. Archive this series and create a new one.',
         );
       }
       const overCapacity = input.capacity === null ? false : (await client.query<QueryResultRow & { over_capacity: boolean }>(

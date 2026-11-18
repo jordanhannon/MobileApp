@@ -845,7 +845,7 @@ test('token hashes are not the raw session token', () => {
   assert.notEqual(hashOpaqueToken('raw-session-token'), 'raw-session-token');
 });
 
-test('staff and admin routes enforce roles, return limited data, and audit admin writes', async () => {
+test('staff and admin routes enforce roles, return limited data, and audit privileged writes', async () => {
   const member = await store.createUser(randomUUID(), 'RBAC Member', 'rbac-member@example.com', 'hash');
   const staff = await store.createUser(randomUUID(), 'RBAC Staff', 'rbac-staff@example.com', 'hash');
   const admin = await store.createUser(randomUUID(), 'RBAC Admin', 'rbac-admin@example.com', 'hash');
@@ -964,7 +964,8 @@ test('staff and admin routes enforce roles, return limited data, and audit admin
   });
   assert.equal(bracketDraw.statusCode, 200);
   assert.equal(bracketDraw.json<{ bracket: TournamentBracket }>().bracket.status, 'drawn');
-  assert.equal((await app.inject({ method: 'GET', url: '/api/admin/events', headers: staffAuth })).statusCode, 403);
+  assert.equal((await app.inject({ method: 'GET', url: '/api/admin/events', headers: staffAuth })).statusCode, 200);
+  assert.equal((await app.inject({ method: 'GET', url: '/api/admin/events', headers: memberAuth })).statusCode, 403);
 
   const eventInput = {
     title: 'RBAC test event',
@@ -976,17 +977,32 @@ test('staff and admin routes enforce roles, return limited data, and audit admin
     recurrence: 'weekly',
     recurrenceUntil: null,
   };
+  assert.equal((await app.inject({
+    method: 'POST',
+    url: '/api/admin/events',
+    headers: memberAuth,
+    payload: eventInput,
+  })).statusCode, 403);
   const createdEvent = await app.inject({
     method: 'POST',
     url: '/api/admin/events',
-    headers: adminAuth,
+    headers: staffAuth,
     payload: { ...eventInput, id: 'client-controlled-id' },
   });
   assert.equal(createdEvent.statusCode, 201);
   const eventId = createdEvent.json<{ event: EventRecord }>().event.id;
   assert.notEqual(eventId, 'client-controlled-id');
   assert.equal(createdEvent.json<{ event: EventRecord }>().event.bracketEnabled, false);
-  const eventOccurrence = '2027-01-01T10:00:00.000Z';
+  const rescheduledStart = '2027-01-02T10:00:00Z';
+  const updatedEvent = await app.inject({
+    method: 'POST',
+    url: `/api/admin/events/${eventId}/update`,
+    headers: staffAuth,
+    payload: { ...eventInput, startsAt: rescheduledStart, bracketEnabled: true },
+  });
+  assert.equal(updatedEvent.statusCode, 200);
+  assert.equal(updatedEvent.json<{ event: EventRecord }>().event.bracketEnabled, true);
+  const eventOccurrence = '2027-01-02T10:00:00.000Z';
   const rsvpCreated = await app.inject({
     method: 'POST',
     url: `/api/events/${eventId}/rsvp`,
@@ -1004,8 +1020,8 @@ test('staff and admin routes enforce roles, return limited data, and audit admin
   assert.equal((await app.inject({
     method: 'POST',
     url: `/api/admin/events/${eventId}/update`,
-    headers: adminAuth,
-    payload: { ...eventInput, capacity: 1 },
+    headers: staffAuth,
+    payload: { ...eventInput, startsAt: rescheduledStart, capacity: 1, bracketEnabled: true },
   })).statusCode, 200);
   const full = await app.inject({
     method: 'POST',
@@ -1015,8 +1031,28 @@ test('staff and admin routes enforce roles, return limited data, and audit admin
   });
   assert.equal(full.statusCode, 409);
   assert.equal(full.json<{ error: { code: string } }>().error.code, 'event_full');
+  assert.equal((await app.inject({
+    method: 'POST',
+    url: `/api/admin/events/${eventId}/archive`,
+    headers: staffAuth,
+    payload: {},
+  })).statusCode, 200);
+
+  const adminEvent = await app.inject({
+    method: 'POST',
+    url: '/api/admin/events',
+    headers: adminAuth,
+    payload: { ...eventInput, title: 'Admin-managed event' },
+  });
+  assert.equal(adminEvent.statusCode, 201);
 
   const rewardInput = { name: 'RBAC reward', pointsCost: 75, icon: '🎁' };
+  assert.equal((await app.inject({
+    method: 'POST',
+    url: '/api/admin/rewards',
+    headers: staffAuth,
+    payload: rewardInput,
+  })).statusCode, 403);
   const createdReward = await app.inject({
     method: 'POST',
     url: '/api/admin/rewards',
@@ -1053,5 +1089,7 @@ test('staff and admin routes enforce roles, return limited data, and audit admin
   })).statusCode, 409);
   assert.ok(store.audit.some(entry => entry.action === 'user.role_change'));
   assert.ok(store.audit.some(entry => entry.action === 'event.create'));
+  assert.ok(store.audit.some(entry => entry.action === 'event.update'));
+  assert.ok(store.audit.some(entry => entry.action === 'event.archive'));
   assert.ok(store.audit.some(entry => entry.action === 'reward.archive'));
 });
