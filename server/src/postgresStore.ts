@@ -1,9 +1,9 @@
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Pool, PoolClient, QueryResultRow } from 'pg';
 import type {
-  Account, AdminReward, AdminUser, EventAttendee, EventInput, EventRecord, MemberEvent,
+  Account, AdminReward, AdminUser, BracketGuest, BracketMatch, EventAttendee, EventInput, EventRecord, MemberEvent,
   PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, SocialIdentityInput,
-  SocialIdentityResult, UserRecord, UserRole,
+  SocialIdentityResult, TournamentBracket, UserRecord, UserRole,
 } from './domain.js';
 import { StoreError } from './domain.js';
 import type { EmailTokenPurpose, Store } from './store.js';
@@ -42,6 +42,7 @@ type EventRow = QueryResultRow & {
   tag: string;
   capacity: number | null;
   rsvp_open: boolean;
+  bracket_enabled: boolean;
   recurrence: EventRecord['recurrence'];
   recurrence_until: string | null;
   active: boolean;
@@ -50,7 +51,9 @@ type EventRow = QueryResultRow & {
 type EventListRow = EventRow & {
   occurrence_start: Date;
   attendee_count: string | number;
+  bracket_participant_count: string | number;
   reserved: boolean | null;
+  bracket_status: 'drawn' | 'completed' | null;
 };
 
 type AdminUserRow = AccountRow & {
@@ -63,6 +66,93 @@ type LedgerRow = QueryResultRow & {
   entry_type: string;
   reference_id: string | null;
   created_at: Date;
+};
+
+type BracketMatchDraft = {
+  id: string;
+  roundNumber: number;
+  matchNumber: number;
+  playerOneId: string | null;
+  playerTwoId: string | null;
+  winnerEntrantId: string | null;
+  nextMatchId: string | null;
+  nextSlot: 'one' | 'two' | null;
+};
+
+function shuffle<T>(items: T[]): T[] {
+  const shuffled = [...items];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = randomInt(index + 1);
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+  }
+  return shuffled;
+}
+
+function makeBracketMatches(userIds: string[]): BracketMatchDraft[] {
+  let slotCount = 1;
+  while (slotCount < userIds.length) slotCount *= 2;
+  const shuffledIds = shuffle(userIds);
+  const byes = slotCount - shuffledIds.length;
+  const roundCounts: number[] = [];
+  for (let count = slotCount / 2; count >= 1; count /= 2) roundCounts.push(count);
+
+  const rounds = roundCounts.map((count, roundIndex) =>
+    Array.from({ length: count }, (_, index): BracketMatchDraft => ({
+      id: randomUUID(),
+      roundNumber: roundIndex + 1,
+      matchNumber: index + 1,
+      playerOneId: null,
+      playerTwoId: null,
+      winnerEntrantId: null,
+      nextMatchId: null,
+      nextSlot: null,
+    })),
+  );
+  for (let roundIndex = 0; roundIndex < rounds.length - 1; roundIndex += 1) {
+    rounds[roundIndex].forEach((match, index) => {
+      match.nextMatchId = rounds[roundIndex + 1][Math.floor(index / 2)].id;
+      match.nextSlot = index % 2 === 0 ? 'one' : 'two';
+    });
+  }
+
+  const firstRound = rounds[0];
+  for (let index = 0; index < firstRound.length; index += 1) {
+    const match = firstRound[index];
+    if (index < byes) {
+      match.playerOneId = shuffledIds[index];
+      match.winnerEntrantId = shuffledIds[index];
+    } else {
+      const entrantIndex = byes + (index - byes) * 2;
+      match.playerOneId = shuffledIds[entrantIndex];
+      match.playerTwoId = shuffledIds[entrantIndex + 1];
+    }
+    if (match.winnerEntrantId && match.nextMatchId) {
+      const next = rounds[1][Math.floor(index / 2)];
+      if (match.nextSlot === 'one') next.playerOneId = match.winnerEntrantId;
+      else next.playerTwoId = match.winnerEntrantId;
+    }
+  }
+  return rounds.flat();
+}
+
+type BracketEntrantRow = QueryResultRow & {
+  entrant_id: string;
+  user_id: string | null;
+  name: string;
+  status?: 'active' | 'waitlisted';
+};
+
+type BracketMatchRow = QueryResultRow & {
+  id: string;
+  round_number: number;
+  match_number: number;
+  player_one_entrant_id: string | null;
+  player_one_name: string | null;
+  player_one_user_id: string | null;
+  player_two_entrant_id: string | null;
+  player_two_name: string | null;
+  player_two_user_id: string | null;
+  winner_entrant_id: string | null;
 };
 
 function toUser(row: UserRow): UserRecord {
@@ -103,6 +193,7 @@ function toEvent(row: EventRow): EventRecord {
     tag: row.tag,
     capacity: row.capacity,
     rsvpOpen: row.rsvp_open,
+    bracketEnabled: row.bracket_enabled,
     recurrence: row.recurrence,
     recurrenceUntil: row.recurrence_until,
     active: row.active,
@@ -115,7 +206,9 @@ function toMemberEvent(row: EventListRow): MemberEvent {
     startsAt: row.occurrence_start.toISOString(),
     occurrenceStart: row.occurrence_start.toISOString(),
     attendeeCount: Number(row.attendee_count),
+    bracketParticipantCount: Number(row.bracket_participant_count),
     reserved: Boolean(row.reserved),
+    bracketStatus: row.bracket_status,
   };
 }
 
@@ -618,17 +711,39 @@ export class PostgresStore implements Store {
              recurrence_until IS NULL
              OR (occurrence_start AT TIME ZONE 'America/New_York')::DATE <= recurrence_until
            )
+       ), occurrences AS (
+         SELECT id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
+                recurrence, recurrence_until, active, occurrence_start,
+                NULL::TEXT AS bracket_status
+         FROM ranked
+         WHERE occurrence_number <= 12
+         UNION ALL
+         SELECT e.id, e.title, e.starts_at, e.description, e.tag, e.capacity, e.rsvp_open,
+                e.bracket_enabled, e.recurrence, e.recurrence_until, e.active,
+                b.occurrence_start, b.status
+         FROM events e
+         JOIN tournament_brackets b ON b.event_id = e.id
+         WHERE e.active = TRUE AND e.bracket_enabled = TRUE
+           AND b.status = 'drawn' AND b.occurrence_start < NOW()
        )
        SELECT e.id, e.title, e.starts_at, e.description, e.tag, e.capacity,
-              e.rsvp_open, e.recurrence, e.recurrence_until::TEXT AS recurrence_until, e.active,
-              e.occurrence_start, COUNT(r.user_id)::INTEGER AS attendee_count,
+              e.rsvp_open, e.bracket_enabled, e.recurrence,
+              e.recurrence_until::TEXT AS recurrence_until, e.active,
+              e.occurrence_start, e.bracket_status, COUNT(r.user_id)::INTEGER AS attendee_count,
+              (
+                SELECT COUNT(*) FROM event_rsvps r2
+                WHERE r2.event_id = e.id AND r2.occurrence_start = e.occurrence_start
+              ) + (
+                SELECT COUNT(*) FROM event_bracket_guests g2
+                WHERE g2.event_id = e.id AND g2.occurrence_start = e.occurrence_start
+              ) AS bracket_participant_count,
               COALESCE(BOOL_OR(r.user_id = $1), FALSE) AS reserved
-       FROM ranked e
+       FROM occurrences e
        LEFT JOIN event_rsvps r
          ON r.event_id = e.id AND r.occurrence_start = e.occurrence_start
-       WHERE e.occurrence_number <= 12
        GROUP BY e.id, e.title, e.starts_at, e.description, e.tag, e.capacity,
-                e.rsvp_open, e.recurrence, e.recurrence_until, e.active, e.occurrence_start
+                e.rsvp_open, e.bracket_enabled, e.recurrence, e.recurrence_until,
+                e.active, e.occurrence_start, e.bracket_status
        ORDER BY e.occurrence_start, e.id`,
       [userId],
     );
@@ -647,11 +762,12 @@ export class PostgresStore implements Store {
         starts_at: Date;
         capacity: number | null;
         rsvp_open: boolean;
+        bracket_enabled: boolean;
         recurrence: EventRecord['recurrence'];
         recurrence_until: string | null;
         active: boolean;
       }>(
-        `SELECT starts_at, capacity, rsvp_open, recurrence,
+        `SELECT starts_at, capacity, rsvp_open, bracket_enabled, recurrence,
                 recurrence_until::TEXT AS recurrence_until, active
          FROM events WHERE id = $1 FOR UPDATE`,
         [eventId],
@@ -668,10 +784,24 @@ export class PostgresStore implements Store {
         await client.query('COMMIT');
         return 'already_rsvped';
       }
-      if (!event.rsvp_open) throw new StoreError('rsvp_closed', 'RSVPs are closed for this event.');
+      if (event.bracket_enabled) {
+        const cutoff = await client.query<QueryResultRow & { open: boolean }>(
+          'SELECT $1::TIMESTAMPTZ > NOW() AS open',
+          [occurrenceStart],
+        );
+        if (!cutoff.rows[0].open) {
+          throw new StoreError('rsvp_closed', 'RSVPs are closed for this event occurrence.');
+        }
+      }
+      if (!event.bracket_enabled && !event.rsvp_open) {
+        throw new StoreError('rsvp_closed', 'RSVPs are closed for this event.');
+      }
 
       const count = await client.query<QueryResultRow & { total: string }>(
-        'SELECT COUNT(*)::TEXT AS total FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2',
+        `SELECT (
+           (SELECT COUNT(*) FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2) +
+           (SELECT COUNT(*) FROM event_bracket_guests WHERE event_id = $1 AND occurrence_start = $2)
+         )::TEXT AS total`,
         [eventId, occurrenceStart],
       );
       if (event.capacity !== null && Number(count.rows[0].total) >= event.capacity) {
@@ -693,20 +823,574 @@ export class PostgresStore implements Store {
   }
 
   async cancelEventRsvp(userId: string, eventId: string, occurrenceStart: string): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const eventResult = await client.query<EventRow>(
+        `SELECT id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
+                recurrence, recurrence_until::TEXT AS recurrence_until, active
+         FROM events WHERE id = $1 FOR UPDATE`,
+        [eventId],
+      );
+      const event = eventResult.rows[0];
+      if (!event) throw new StoreError('event_not_found', 'Event not found.');
+      await this.assertEventOccurrence(eventId, occurrenceStart, event, client);
+      if (event.bracket_enabled) {
+        const cutoff = await client.query<QueryResultRow & { open: boolean }>(
+          'SELECT $1::TIMESTAMPTZ > NOW() AS open',
+          [occurrenceStart],
+        );
+        if (!cutoff.rows[0].open) {
+          throw new StoreError('rsvp_closed', 'RSVPs are closed for this event occurrence.');
+        }
+      }
+      const result = await client.query(
+        'DELETE FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2 AND user_id = $3',
+        [eventId, occurrenceStart, userId],
+      );
+      await client.query('COMMIT');
+      return Boolean(result.rowCount);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async finalizeDueBrackets(): Promise<void> {
+    const result = await this.pool.query<QueryResultRow & {
+      event_id: string;
+      occurrence_start: Date;
+    }>(
+      `WITH clock AS (
+         SELECT NOW() AS now_utc, NOW() AT TIME ZONE 'America/New_York' AS now_local
+       ), anchors AS (
+         SELECT e.id, e.starts_at, e.recurrence, e.recurrence_until,
+                e.starts_at AT TIME ZONE 'America/New_York' AS local_start,
+                clock.now_utc, clock.now_local,
+                CASE e.recurrence
+                  WHEN 'weekly' THEN GREATEST(
+                    0,
+                    FLOOR(EXTRACT(EPOCH FROM (
+                      clock.now_local - (e.starts_at AT TIME ZONE 'America/New_York')
+                    )) / 604800)::INTEGER
+                  )
+                  WHEN 'monthly' THEN GREATEST(
+                    0,
+                    (
+                      (EXTRACT(YEAR FROM clock.now_local)::INTEGER -
+                       EXTRACT(YEAR FROM (e.starts_at AT TIME ZONE 'America/New_York'))::INTEGER) * 12
+                      + EXTRACT(MONTH FROM clock.now_local)::INTEGER
+                      - EXTRACT(MONTH FROM (e.starts_at AT TIME ZONE 'America/New_York'))::INTEGER
+                    )
+                  )
+                  ELSE 0
+                END AS last_index
+         FROM events e
+         CROSS JOIN clock
+         WHERE e.active = TRUE AND e.bracket_enabled = TRUE
+       ), occurrences AS (
+         SELECT anchors.id AS event_id,
+                (
+                  local_start + CASE recurrence
+                    WHEN 'weekly' THEN indices.n * INTERVAL '1 week'
+                    WHEN 'monthly' THEN indices.n * INTERVAL '1 month'
+                    ELSE INTERVAL '0'
+                  END
+                ) AT TIME ZONE 'America/New_York' AS occurrence_start,
+                anchors.recurrence_until
+         FROM anchors
+         CROSS JOIN LATERAL generate_series(0, last_index) AS indices(n)
+       )
+       SELECT o.event_id, o.occurrence_start
+       FROM occurrences o
+       WHERE o.occurrence_start <= NOW()
+         AND (
+           o.recurrence_until IS NULL
+           OR (o.occurrence_start AT TIME ZONE 'America/New_York')::DATE <= o.recurrence_until
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM tournament_brackets b
+           WHERE b.event_id = o.event_id AND b.occurrence_start = o.occurrence_start
+         )
+         AND (
+           EXISTS (
+             SELECT 1 FROM event_rsvps r
+             WHERE r.event_id = o.event_id AND r.occurrence_start = o.occurrence_start
+           )
+           OR EXISTS (
+             SELECT 1 FROM event_bracket_guests g
+             WHERE g.event_id = o.event_id AND g.occurrence_start = o.occurrence_start
+           )
+         )
+       ORDER BY o.occurrence_start, o.event_id`,
+    );
+    for (const row of result.rows) {
+      await this.drawEventBracket(null, row.event_id, row.occurrence_start.toISOString());
+    }
+  }
+
+  async getEventBracket(eventId: string, occurrenceStart: string): Promise<TournamentBracket> {
     const eventResult = await this.pool.query<EventRow>(
-      `SELECT id, title, starts_at, description, tag, capacity, rsvp_open,
-             recurrence, recurrence_until::TEXT AS recurrence_until, active
+      `SELECT id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
+              recurrence, recurrence_until::TEXT AS recurrence_until, active
        FROM events WHERE id = $1`,
       [eventId],
     );
     const event = eventResult.rows[0];
     if (!event) throw new StoreError('event_not_found', 'Event not found.');
+    if (!event.bracket_enabled) {
+      throw new StoreError('bracket_disabled_conflict', 'Tournament brackets are disabled for this event.');
+    }
     await this.assertEventOccurrence(eventId, occurrenceStart, event, this.pool);
-    const result = await this.pool.query(
-      'DELETE FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2 AND user_id = $3',
-      [eventId, occurrenceStart, userId],
+
+    const [bracketResult, participantResult, cutoffResult] = await Promise.all([
+      this.pool.query<QueryResultRow & {
+        status: 'drawn' | 'completed';
+        randomized_at: Date;
+        champion_entrant_id: string | null;
+      }>(
+        `SELECT status, randomized_at, champion_entrant_id
+         FROM tournament_brackets
+         WHERE event_id = $1 AND occurrence_start = $2`,
+        [eventId, occurrenceStart],
+      ),
+      this.pool.query<QueryResultRow & { total: string }>(
+        `SELECT (
+           (SELECT COUNT(*) FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2) +
+           (SELECT COUNT(*) FROM event_bracket_guests WHERE event_id = $1 AND occurrence_start = $2)
+         )::TEXT AS total`,
+        [eventId, occurrenceStart],
+      ),
+      this.pool.query<QueryResultRow & { passed: boolean }>(
+        'SELECT $1::TIMESTAMPTZ <= NOW() AS passed',
+        [occurrenceStart],
+      ),
+    ]);
+    const bracket = bracketResult.rows[0];
+    const cutoffPassed = cutoffResult.rows[0].passed;
+
+    let entrants: TournamentBracket['entrants'] = [];
+    const rounds: BracketMatch[][] = [];
+    if (bracket) {
+      const entrantResult = await this.pool.query<BracketEntrantRow>(
+        `SELECT e.entrant_id, e.user_id, e.display_name AS name, e.status
+         FROM tournament_bracket_entrants e
+         WHERE e.event_id = $1 AND e.occurrence_start = $2
+         ORDER BY e.created_at, e.display_name, e.entrant_id`,
+        [eventId, occurrenceStart],
+      );
+      entrants = entrantResult.rows.map(entrant => ({
+        entrantId: entrant.entrant_id,
+        userId: entrant.user_id,
+        name: entrant.name,
+        status: entrant.status ?? 'active',
+      }));
+
+      const matchResult = await this.pool.query<BracketMatchRow>(
+        `SELECT m.id, m.round_number, m.match_number,
+                m.player_one_entrant_id, p1.display_name AS player_one_name,
+                p1.user_id AS player_one_user_id,
+                m.player_two_entrant_id, p2.display_name AS player_two_name,
+                p2.user_id AS player_two_user_id,
+                m.winner_entrant_id
+         FROM tournament_bracket_matches m
+         LEFT JOIN tournament_bracket_entrants p1
+           ON p1.event_id = m.event_id AND p1.occurrence_start = m.occurrence_start
+           AND p1.entrant_id = m.player_one_entrant_id
+         LEFT JOIN tournament_bracket_entrants p2
+           ON p2.event_id = m.event_id AND p2.occurrence_start = m.occurrence_start
+           AND p2.entrant_id = m.player_two_entrant_id
+         WHERE m.event_id = $1 AND m.occurrence_start = $2
+         ORDER BY m.round_number, m.match_number`,
+        [eventId, occurrenceStart],
+      );
+      for (const match of matchResult.rows) {
+        const round = rounds[match.round_number - 1] ?? (rounds[match.round_number - 1] = []);
+        round.push({
+          id: match.id,
+          roundNumber: match.round_number,
+          matchNumber: match.match_number,
+          playerOne: match.player_one_entrant_id && match.player_one_name
+            ? {
+              entrantId: match.player_one_entrant_id,
+              userId: match.player_one_user_id,
+              name: match.player_one_name,
+            }
+            : null,
+          playerTwo: match.player_two_entrant_id && match.player_two_name
+            ? {
+              entrantId: match.player_two_entrant_id,
+              userId: match.player_two_user_id,
+              name: match.player_two_name,
+            }
+            : null,
+          winnerEntrantId: match.winner_entrant_id,
+        });
+      }
+    }
+
+    return {
+      eventId,
+      occurrenceStart: new Date(occurrenceStart).toISOString(),
+      cutoffAt: new Date(occurrenceStart).toISOString(),
+      participantCount: bracket ? entrants.length : Number(participantResult.rows[0].total),
+      status: cutoffPassed ? bracket?.status ?? 'not_started' : 'not_started',
+      randomizedAt: cutoffPassed ? bracket?.randomized_at.toISOString() ?? null : null,
+      entrants: cutoffPassed ? entrants : [],
+      rounds: cutoffPassed ? rounds : [],
+      championEntrantId: cutoffPassed ? bracket?.champion_entrant_id ?? null : null,
+    };
+  }
+
+  async drawEventBracket(
+    actorId: string | null,
+    eventId: string,
+    occurrenceStart: string,
+  ): Promise<TournamentBracket> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const eventResult = await client.query<EventRow>(
+        `SELECT id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
+                recurrence, recurrence_until::TEXT AS recurrence_until, active
+         FROM events WHERE id = $1 FOR UPDATE`,
+        [eventId],
+      );
+      const event = eventResult.rows[0];
+      if (!event || !event.active) throw new StoreError('event_not_found', 'Event not found.');
+      if (!event.bracket_enabled) {
+        throw new StoreError('bracket_disabled_conflict', 'Tournament brackets are disabled for this event.');
+      }
+      await this.assertEventOccurrence(eventId, occurrenceStart, event, client);
+
+      const cutoffResult = await client.query<QueryResultRow & { passed: boolean }>(
+        'SELECT $1::TIMESTAMPTZ <= NOW() AS passed',
+        [occurrenceStart],
+      );
+      if (!cutoffResult.rows[0].passed) {
+        throw new StoreError('bracket_cutoff_open_conflict', 'The bracket is randomized when RSVPs close at event start.');
+      }
+
+      const existing = await client.query<QueryResultRow>(
+        `SELECT 1 FROM tournament_brackets
+         WHERE event_id = $1 AND occurrence_start = $2 FOR UPDATE`,
+        [eventId, occurrenceStart],
+      );
+      if (existing.rowCount) {
+        await client.query('COMMIT');
+      } else {
+        const entrantResult = await client.query<QueryResultRow & {
+          entrant_id: string;
+          user_id: string | null;
+          name: string;
+        }>(
+          `SELECT r.user_id AS entrant_id, r.user_id, u.name, r.created_at
+           FROM event_rsvps r
+           JOIN users u ON u.id = r.user_id
+           WHERE r.event_id = $1 AND r.occurrence_start = $2
+           UNION ALL
+           SELECT g.id AS entrant_id, NULL::UUID AS user_id, g.name, g.created_at
+           FROM event_bracket_guests g
+           WHERE g.event_id = $1 AND g.occurrence_start = $2
+           ORDER BY created_at, entrant_id`,
+          [eventId, occurrenceStart],
+        );
+        if (entrantResult.rowCount === 0) {
+          throw new StoreError('bracket_empty_conflict', 'At least one participant is required to create a bracket.');
+        }
+        const entrantIds = entrantResult.rows.map(row => row.entrant_id);
+        const championId = entrantIds.length === 1 ? entrantIds[0] : null;
+        await client.query(
+          `INSERT INTO tournament_brackets
+             (event_id, occurrence_start, status, created_by, champion_entrant_id, draw_source)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            eventId, occurrenceStart, entrantIds.length === 1 ? 'completed' : 'drawn',
+            actorId, championId, actorId === null ? 'system' : 'staff',
+          ],
+        );
+        for (const entrant of entrantResult.rows) {
+          await client.query(
+            `INSERT INTO tournament_bracket_entrants
+               (entrant_id, event_id, occurrence_start, user_id, display_name, status)
+             VALUES ($1, $2, $3, $4, $5, 'active')`,
+            [entrant.entrant_id, eventId, occurrenceStart, entrant.user_id, entrant.name],
+          );
+        }
+
+        if (entrantIds.length > 1) {
+          const matches = makeBracketMatches(entrantIds);
+          for (const match of [...matches].sort((a, b) => b.roundNumber - a.roundNumber || a.matchNumber - b.matchNumber)) {
+            await client.query(
+              `INSERT INTO tournament_bracket_matches
+                 (id, event_id, occurrence_start, round_number, match_number,
+                  player_one_entrant_id, player_two_entrant_id, winner_entrant_id, next_match_id, next_slot)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+              [
+                match.id, eventId, occurrenceStart, match.roundNumber, match.matchNumber,
+                match.playerOneId, match.playerTwoId, match.winnerEntrantId, match.nextMatchId, match.nextSlot,
+              ],
+            );
+          }
+        }
+        await this.writeAudit(client, actorId, 'tournament.bracket_draw', 'event_occurrence',
+          `${eventId}:${new Date(occurrenceStart).toISOString()}`, {
+            entrants: entrantIds.length,
+            source: actorId === null ? 'system' : 'staff',
+          });
+        await client.query('COMMIT');
+      }
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.getEventBracket(eventId, occurrenceStart);
+  }
+
+  async listBracketGuests(eventId: string, occurrenceStart: string): Promise<BracketGuest[]> {
+    const eventResult = await this.pool.query<EventRow>(
+      `SELECT id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
+              recurrence, recurrence_until::TEXT AS recurrence_until, active
+       FROM events WHERE id = $1`,
+      [eventId],
     );
-    return Boolean(result.rowCount);
+    const event = eventResult.rows[0];
+    if (!event) throw new StoreError('event_not_found', 'Event not found.');
+    if (!event.bracket_enabled) {
+      throw new StoreError('bracket_disabled_conflict', 'Tournament brackets are disabled for this event.');
+    }
+    await this.assertEventOccurrence(eventId, occurrenceStart, event, this.pool);
+    const result = await this.pool.query<QueryResultRow & {
+      id: string;
+      name: string;
+      created_at: Date;
+    }>(
+      `SELECT id, name, created_at FROM event_bracket_guests
+       WHERE event_id = $1 AND occurrence_start = $2
+       ORDER BY created_at, id`,
+      [eventId, occurrenceStart],
+    );
+    return result.rows.map(row => ({ id: row.id, name: row.name, createdAt: row.created_at.toISOString() }));
+  }
+
+  async addBracketGuest(
+    actorId: string,
+    eventId: string,
+    occurrenceStart: string,
+    name: string,
+  ): Promise<BracketGuest> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const eventResult = await client.query<EventRow>(
+        `SELECT id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
+                recurrence, recurrence_until::TEXT AS recurrence_until, active
+         FROM events WHERE id = $1 FOR UPDATE`,
+        [eventId],
+      );
+      const event = eventResult.rows[0];
+      if (!event || !event.active) throw new StoreError('event_not_found', 'Event not found.');
+      if (!event.bracket_enabled) {
+        throw new StoreError('bracket_disabled_conflict', 'Tournament brackets are disabled for this event.');
+      }
+      await this.assertEventOccurrence(eventId, occurrenceStart, event, client);
+      const cutoff = await client.query<QueryResultRow & { open: boolean }>(
+        'SELECT $1::TIMESTAMPTZ > NOW() AS open',
+        [occurrenceStart],
+      );
+      if (!cutoff.rows[0].open) {
+        throw new StoreError('rsvp_closed', 'Guest entries are closed for this event occurrence.');
+      }
+
+      const count = await client.query<QueryResultRow & { total: string }>(
+        `SELECT (
+           (SELECT COUNT(*) FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2) +
+           (SELECT COUNT(*) FROM event_bracket_guests WHERE event_id = $1 AND occurrence_start = $2)
+         )::TEXT AS total`,
+        [eventId, occurrenceStart],
+      );
+      if (event.capacity !== null && Number(count.rows[0].total) >= event.capacity) {
+        throw new StoreError('event_full', 'This event has reached capacity.');
+      }
+      const result = await client.query<QueryResultRow & {
+        id: string;
+        name: string;
+        created_at: Date;
+      }>(
+        `INSERT INTO event_bracket_guests (event_id, occurrence_start, name, created_by)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, name, created_at`,
+        [eventId, occurrenceStart, name, actorId],
+      );
+      const guest = {
+        id: result.rows[0].id,
+        name: result.rows[0].name,
+        createdAt: result.rows[0].created_at.toISOString(),
+      };
+      await this.writeAudit(client, actorId, 'tournament.guest_add', 'event_occurrence',
+        `${eventId}:${new Date(occurrenceStart).toISOString()}`, { guestId: guest.id, name: guest.name });
+      await client.query('COMMIT');
+      return guest;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async removeBracketGuest(
+    actorId: string,
+    eventId: string,
+    occurrenceStart: string,
+    guestId: string,
+  ): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const eventResult = await client.query<EventRow>(
+        `SELECT id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
+                recurrence, recurrence_until::TEXT AS recurrence_until, active
+         FROM events WHERE id = $1 FOR UPDATE`,
+        [eventId],
+      );
+      const event = eventResult.rows[0];
+      if (!event || !event.active) throw new StoreError('event_not_found', 'Event not found.');
+      if (!event.bracket_enabled) {
+        throw new StoreError('bracket_disabled_conflict', 'Tournament brackets are disabled for this event.');
+      }
+      await this.assertEventOccurrence(eventId, occurrenceStart, event, client);
+      const cutoff = await client.query<QueryResultRow & { open: boolean }>(
+        'SELECT $1::TIMESTAMPTZ > NOW() AS open',
+        [occurrenceStart],
+      );
+      if (!cutoff.rows[0].open) {
+        throw new StoreError('rsvp_closed', 'Guest entries are closed for this event occurrence.');
+      }
+      const result = await client.query(
+        `DELETE FROM event_bracket_guests
+         WHERE id = $1 AND event_id = $2 AND occurrence_start = $3`,
+        [guestId, eventId, occurrenceStart],
+      );
+      if (!result.rowCount) throw new StoreError('bracket_guest_not_found', 'Guest entry not found.');
+      await this.writeAudit(client, actorId, 'tournament.guest_remove', 'event_occurrence',
+        `${eventId}:${new Date(occurrenceStart).toISOString()}`, { guestId });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async recordBracketWinner(
+    actorId: string,
+    eventId: string,
+    occurrenceStart: string,
+    matchId: string,
+    winnerEntrantId: string,
+  ): Promise<TournamentBracket> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const eventResult = await client.query<EventRow>(
+        `SELECT id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
+                recurrence, recurrence_until::TEXT AS recurrence_until, active
+         FROM events WHERE id = $1 FOR UPDATE`,
+        [eventId],
+      );
+      const event = eventResult.rows[0];
+      if (!event) throw new StoreError('event_not_found', 'Event not found.');
+      if (!event.bracket_enabled) {
+        throw new StoreError('bracket_disabled_conflict', 'Tournament brackets are disabled for this event.');
+      }
+      await this.assertEventOccurrence(eventId, occurrenceStart, event, client);
+
+      const bracketResult = await client.query<QueryResultRow & { status: 'drawn' | 'completed' }>(
+        `SELECT status FROM tournament_brackets
+         WHERE event_id = $1 AND occurrence_start = $2 FOR UPDATE`,
+        [eventId, occurrenceStart],
+      );
+      const bracket = bracketResult.rows[0];
+      if (!bracket) throw new StoreError('bracket_not_found', 'The bracket has not been drawn.');
+
+      const matchResult = await client.query<QueryResultRow & {
+        player_one_entrant_id: string | null;
+        player_two_entrant_id: string | null;
+        winner_entrant_id: string | null;
+        next_match_id: string | null;
+        next_slot: 'one' | 'two' | null;
+      }>(
+        `SELECT player_one_entrant_id, player_two_entrant_id, winner_entrant_id, next_match_id, next_slot
+         FROM tournament_bracket_matches
+         WHERE id = $1 AND event_id = $2 AND occurrence_start = $3
+         FOR UPDATE`,
+        [matchId, eventId, occurrenceStart],
+      );
+      const match = matchResult.rows[0];
+      if (!match) throw new StoreError('bracket_match_not_found', 'Bracket match not found.');
+      if (match.winner_entrant_id !== winnerEntrantId) {
+        if (bracket.status === 'completed') {
+          throw new StoreError('bracket_completed_conflict', 'The bracket is already complete.');
+        }
+        if (!match.player_one_entrant_id || !match.player_two_entrant_id) {
+          throw new StoreError('bracket_match_not_ready_conflict', 'Both players must be known before recording a winner.');
+        }
+        if (winnerEntrantId !== match.player_one_entrant_id && winnerEntrantId !== match.player_two_entrant_id) {
+          throw new StoreError('bracket_winner_invalid', 'The winner must be one of the players in this match.');
+        }
+        if (match.winner_entrant_id) {
+          throw new StoreError('bracket_match_completed_conflict', 'This match already has a recorded winner.');
+        }
+
+        await client.query(
+          `UPDATE tournament_bracket_matches
+           SET winner_entrant_id = $4
+           WHERE id = $1 AND event_id = $2 AND occurrence_start = $3`,
+          [matchId, eventId, occurrenceStart, winnerEntrantId],
+        );
+        if (match.next_match_id && match.next_slot) {
+          const column = match.next_slot === 'one' ? 'player_one_entrant_id' : 'player_two_entrant_id';
+          const advanceResult = await client.query(
+            `UPDATE tournament_bracket_matches
+             SET ${column} = $4
+             WHERE id = $1 AND event_id = $2 AND occurrence_start = $3
+               AND (${column} IS NULL OR ${column} = $4)`,
+            [match.next_match_id, eventId, occurrenceStart, winnerEntrantId],
+          );
+          if (!advanceResult.rowCount) {
+            throw new StoreError('bracket_advancement_conflict', 'The winner could not be advanced to the next round.');
+          }
+        } else {
+          await client.query(
+            `UPDATE tournament_brackets
+             SET status = 'completed', champion_entrant_id = $3
+             WHERE event_id = $1 AND occurrence_start = $2`,
+            [eventId, occurrenceStart, winnerEntrantId],
+          );
+        }
+        await this.writeAudit(
+          client,
+          actorId,
+          'tournament.match_winner',
+          'bracket_match',
+          matchId,
+          { winnerEntrantId },
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.getEventBracket(eventId, occurrenceStart);
   }
 
   async listEventAttendees(
@@ -716,7 +1400,7 @@ export class PostgresStore implements Store {
     offset: number,
   ): Promise<{ event: EventRecord; total: number; attendees: EventAttendee[] }> {
     const eventResult = await this.pool.query<EventRow>(
-      `SELECT id, title, starts_at, description, tag, capacity, rsvp_open,
+      `SELECT id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
              recurrence, recurrence_until::TEXT AS recurrence_until, active
        FROM events WHERE id = $1`,
       [eventId],
@@ -840,7 +1524,7 @@ export class PostgresStore implements Store {
 
   async listAdminEvents(): Promise<EventRecord[]> {
     const result = await this.pool.query<EventRow>(
-      `SELECT id, title, starts_at, description, tag, capacity, rsvp_open,
+      `SELECT id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
               recurrence, recurrence_until::TEXT AS recurrence_until, active
        FROM events ORDER BY starts_at, id`,
     );
@@ -860,13 +1544,14 @@ export class PostgresStore implements Store {
       await client.query('BEGIN');
       const result = await client.query<EventRow>(
         `INSERT INTO events
-           (id, title, starts_at, description, tag, capacity, rsvp_open, recurrence, recurrence_until)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         RETURNING id, title, starts_at, description, tag, capacity, rsvp_open,
+           (id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled, recurrence, recurrence_until)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
                    recurrence, recurrence_until::TEXT AS recurrence_until, active`,
         [
           input.id, input.title, input.startsAt, input.description,
-          input.tag, input.capacity, input.rsvpOpen, input.recurrence, input.recurrenceUntil,
+          input.tag, input.capacity, input.rsvpOpen, input.bracketEnabled,
+          input.recurrence, input.recurrenceUntil,
         ],
       );
       const event = toEvent(result.rows[0]);
@@ -887,7 +1572,7 @@ export class PostgresStore implements Store {
     try {
       await client.query('BEGIN');
       const currentResult = await client.query<EventRow>(
-        `SELECT id, title, starts_at, description, tag, capacity, rsvp_open,
+        `SELECT id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
                 recurrence, recurrence_until::TEXT AS recurrence_until, active
          FROM events WHERE id = $1 FOR UPDATE`,
         [eventId],
@@ -895,7 +1580,10 @@ export class PostgresStore implements Store {
       const current = currentResult.rows[0];
       if (!current) throw new StoreError('event_not_found', 'Event not found.');
       const rsvpCount = await client.query<QueryResultRow & { total: string }>(
-        'SELECT COUNT(*)::TEXT AS total FROM event_rsvps WHERE event_id = $1',
+        `SELECT (
+           (SELECT COUNT(*) FROM event_rsvps WHERE event_id = $1) +
+           (SELECT COUNT(*) FROM event_bracket_guests WHERE event_id = $1)
+         )::TEXT AS total`,
         [eventId],
       );
       if (Number(rsvpCount.rows[0].total) > 0 &&
@@ -908,9 +1596,13 @@ export class PostgresStore implements Store {
         );
       }
       const overCapacity = input.capacity === null ? false : (await client.query<QueryResultRow & { over_capacity: boolean }>(
-        `SELECT EXISTS (
-           SELECT 1 FROM event_rsvps
-           WHERE event_id = $1
+        `WITH participants AS (
+           SELECT event_id, occurrence_start FROM event_rsvps WHERE event_id = $1
+           UNION ALL
+           SELECT event_id, occurrence_start FROM event_bracket_guests WHERE event_id = $1
+         )
+         SELECT EXISTS (
+           SELECT 1 FROM participants
            GROUP BY occurrence_start
            HAVING COUNT(*) > $2
          ) AS over_capacity`,
@@ -922,13 +1614,14 @@ export class PostgresStore implements Store {
       const result = await client.query<EventRow>(
         `UPDATE events
          SET title = $2, starts_at = $3, description = $4, tag = $5, capacity = $6,
-             rsvp_open = $7, recurrence = $8, recurrence_until = $9, updated_at = NOW()
+             rsvp_open = $7, bracket_enabled = $8, recurrence = $9, recurrence_until = $10,
+             updated_at = NOW()
          WHERE id = $1
-         RETURNING id, title, starts_at, description, tag, capacity, rsvp_open,
+         RETURNING id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
                    recurrence, recurrence_until::TEXT AS recurrence_until, active`,
         [
           eventId, input.title, input.startsAt, input.description, input.tag,
-          input.capacity, input.rsvpOpen, input.recurrence, input.recurrenceUntil,
+          input.capacity, input.rsvpOpen, input.bracketEnabled, input.recurrence, input.recurrenceUntil,
         ],
       );
       const event = toEvent(result.rows[0]);
@@ -953,7 +1646,7 @@ export class PostgresStore implements Store {
       const result = await client.query<EventRow>(
         `UPDATE events SET active = FALSE, rsvp_open = FALSE, updated_at = NOW()
          WHERE id = $1 AND active = TRUE
-         RETURNING id, title, starts_at, description, tag, capacity, rsvp_open,
+         RETURNING id, title, starts_at, description, tag, capacity, rsvp_open, bracket_enabled,
                    recurrence, recurrence_until::TEXT AS recurrence_until, active`,
         [eventId],
       );
@@ -1138,7 +1831,7 @@ export class PostgresStore implements Store {
 
   private async writeAudit(
     client: PoolClient,
-    actorId: string,
+    actorId: string | null,
     action: string,
     targetType: string,
     targetId: string,

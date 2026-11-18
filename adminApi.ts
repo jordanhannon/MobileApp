@@ -47,6 +47,7 @@ export type ManagedEventInput = {
   tag: string;
   capacity: number | null;
   rsvpOpen: boolean;
+  bracketEnabled: boolean;
   recurrence: 'none' | 'weekly' | 'monthly';
   recurrenceUntil: string | null;
 };

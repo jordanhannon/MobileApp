@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { createApp } from '../src/app.js';
 import type {
-  Account, AdminReward, AdminUser, EventAttendee, EventInput, EventRecord, MemberEvent,
+  Account, AdminReward, AdminUser, BracketGuest, EventAttendee, EventInput, EventRecord, MemberEvent, TournamentBracket,
   PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, SocialIdentityInput,
   SocialIdentityProvider, SocialIdentityResult, UserRecord, UserRole,
 } from '../src/domain.js';
@@ -41,16 +41,19 @@ class MemoryStore implements Store {
   readonly balances = new Map<string, number>();
   readonly redemptions = new Map<string, Extract<RedemptionResult, { kind: 'redeemed' }>>();
   readonly rsvps = new Map<string, Set<string>>();
-  readonly audit: Array<{ actorId: string; action: string; targetId: string }> = [];
+  readonly guests = new Map<string, BracketGuest[]>();
+  readonly brackets = new Map<string, TournamentBracket>();
+  readonly audit: Array<{ actorId: string | null; action: string; targetId: string }> = [];
   readonly events: EventRecord[] = [
     {
       id: 'tasting',
       title: 'A taste of the season',
-      startsAt: '2026-11-14T16:00:00.000Z',
+      startsAt: new Date(Date.now() + 60_000).toISOString(),
       description: 'Meet our seasonal favorites with a tasting made for our members.',
       tag: 'MEMBER EXCLUSIVE',
       capacity: null,
       rsvpOpen: true,
+      bracketEnabled: true,
       recurrence: 'none',
       recurrenceUntil: null,
       active: true,
@@ -239,7 +242,14 @@ class MemoryStore implements Store {
       ...event,
       occurrenceStart: event.startsAt,
       attendeeCount: this.rsvps.get(`${event.id}:${event.startsAt}`)?.size ?? 0,
+      bracketParticipantCount: (this.rsvps.get(`${event.id}:${event.startsAt}`)?.size ?? 0) +
+        (this.guests.get(`${event.id}:${event.startsAt}`)?.length ?? 0),
       reserved: this.rsvps.get(`${event.id}:${event.startsAt}`)?.has(userId) ?? false,
+      bracketStatus: this.brackets.get(`${event.id}:${event.startsAt}`)?.status === 'drawn'
+        ? 'drawn'
+        : this.brackets.get(`${event.id}:${event.startsAt}`)?.status === 'completed'
+          ? 'completed'
+          : null,
     }));
   }
 
@@ -249,8 +259,14 @@ class MemoryStore implements Store {
     const key = `${eventId}:${occurrenceStart}`;
     const attendees = this.rsvps.get(key) ?? new Set<string>();
     if (attendees.has(userId)) return 'already_rsvped';
-    if (!event.rsvpOpen) throw new StoreError('rsvp_closed', 'RSVPs are closed for this event.');
-    if (event.capacity !== null && attendees.size >= event.capacity) {
+    if (event.bracketEnabled && Date.parse(occurrenceStart) <= Date.now()) {
+      throw new StoreError('rsvp_closed', 'RSVPs are closed for this event occurrence.');
+    }
+    if (!event.bracketEnabled && !event.rsvpOpen) {
+      throw new StoreError('rsvp_closed', 'RSVPs are closed for this event.');
+    }
+    const guestCount = this.guests.get(key)?.length ?? 0;
+    if (event.capacity !== null && attendees.size + guestCount >= event.capacity) {
       throw new StoreError('event_full', 'This event has reached capacity.');
     }
     attendees.add(userId);
@@ -259,8 +275,140 @@ class MemoryStore implements Store {
   }
 
   async cancelEventRsvp(userId: string, eventId: string, occurrenceStart: string): Promise<boolean> {
+    const event = this.events.find(item => item.id === eventId);
+    if (event?.bracketEnabled && Date.parse(occurrenceStart) <= Date.now()) {
+      throw new StoreError('rsvp_closed', 'RSVPs are closed for this event occurrence.');
+    }
     const attendees = this.rsvps.get(`${eventId}:${occurrenceStart}`);
     return attendees?.delete(userId) ?? false;
+  }
+
+  async getEventBracket(eventId: string, occurrenceStart: string): Promise<TournamentBracket> {
+    const key = `${eventId}:${occurrenceStart}`;
+    const event = this.events.find(item => item.id === eventId);
+    if (!event) throw new StoreError('event_not_found', 'Event not found.');
+    if (!event.bracketEnabled) throw new StoreError('bracket_disabled_conflict', 'Tournament brackets are disabled.');
+    const bracket = this.brackets.get(key);
+    if (bracket) return bracket;
+    const participantCount = (this.rsvps.get(key)?.size ?? 0) + (this.guests.get(key)?.length ?? 0);
+    return {
+      eventId,
+      occurrenceStart,
+      cutoffAt: occurrenceStart,
+      participantCount,
+      status: 'not_started',
+      randomizedAt: null,
+      entrants: [],
+      rounds: [],
+      championEntrantId: null,
+    };
+  }
+
+  async finalizeDueBrackets(): Promise<void> {
+    for (const event of this.events.filter(item => item.active && item.bracketEnabled)) {
+      const occurrenceStart = event.startsAt;
+      if (Date.parse(occurrenceStart) > Date.now()) continue;
+      const key = `${event.id}:${occurrenceStart}`;
+      if ((this.rsvps.get(key)?.size ?? 0) + (this.guests.get(key)?.length ?? 0) === 0) continue;
+      if (!this.brackets.has(key)) await this.drawEventBracket(null, event.id, occurrenceStart);
+    }
+  }
+
+  async drawEventBracket(
+    actorId: string | null,
+    eventId: string,
+    occurrenceStart: string,
+  ): Promise<TournamentBracket> {
+    const current = await this.getEventBracket(eventId, occurrenceStart);
+    if (Date.parse(occurrenceStart) > Date.now()) {
+      throw new StoreError('bracket_cutoff_open_conflict', 'The bracket is randomized at event start.');
+    }
+    if (current.status !== 'not_started') return current;
+    const key = `${eventId}:${occurrenceStart}`;
+    const userEntrants = [...(this.rsvps.get(key) ?? [])]
+      .map(userId => [...this.users.values()].find(user => user.id === userId))
+      .filter((user): user is UserRecord => Boolean(user))
+      .map(user => ({ entrantId: user.id, userId: user.id, name: user.name, status: 'active' as const }));
+    const guestEntrants = (this.guests.get(key) ?? []).map(guest => ({
+      entrantId: guest.id,
+      userId: null,
+      name: guest.name,
+      status: 'active' as const,
+    }));
+    const entrants = [...userEntrants, ...guestEntrants];
+    if (entrants.length === 0) {
+      throw new StoreError('bracket_empty_conflict', 'At least one participant is required.');
+    }
+    const bracket: TournamentBracket = {
+      ...current,
+      participantCount: entrants.length,
+      status: entrants.length === 1 ? 'completed' : 'drawn',
+      randomizedAt: new Date().toISOString(),
+      entrants,
+      championEntrantId: entrants.length === 1 ? entrants[0].entrantId : null,
+    };
+    this.brackets.set(key, bracket);
+    this.audit.push({ actorId, action: 'tournament.bracket_draw', targetId: `${eventId}:${occurrenceStart}` });
+    return bracket;
+  }
+
+  async listBracketGuests(eventId: string, occurrenceStart: string): Promise<BracketGuest[]> {
+    return [...(this.guests.get(`${eventId}:${occurrenceStart}`) ?? [])];
+  }
+
+  async addBracketGuest(
+    actorId: string,
+    eventId: string,
+    occurrenceStart: string,
+    name: string,
+  ): Promise<BracketGuest> {
+    const event = this.events.find(item => item.id === eventId && item.active);
+    if (!event) throw new StoreError('event_not_found', 'Event not found.');
+    if (!event.bracketEnabled) throw new StoreError('bracket_disabled_conflict', 'Tournament brackets are disabled.');
+    if (Date.parse(occurrenceStart) <= Date.now()) {
+      throw new StoreError('rsvp_closed', 'Guest entries are closed for this event occurrence.');
+    }
+    const key = `${eventId}:${occurrenceStart}`;
+    const current = this.guests.get(key) ?? [];
+    if (event.capacity !== null && current.length + (this.rsvps.get(key)?.size ?? 0) >= event.capacity) {
+      throw new StoreError('event_full', 'This event has reached capacity.');
+    }
+    const guest = { id: randomUUID(), name, createdAt: new Date().toISOString() };
+    current.push(guest);
+    this.guests.set(key, current);
+    this.audit.push({ actorId, action: 'tournament.guest_add', targetId: `${eventId}:${occurrenceStart}` });
+    return guest;
+  }
+
+  async removeBracketGuest(
+    actorId: string,
+    eventId: string,
+    occurrenceStart: string,
+    guestId: string,
+  ): Promise<void> {
+    if (Date.parse(occurrenceStart) <= Date.now()) {
+      throw new StoreError('rsvp_closed', 'Guest entries are closed for this event occurrence.');
+    }
+    const key = `${eventId}:${occurrenceStart}`;
+    const guests = this.guests.get(key) ?? [];
+    const index = guests.findIndex(guest => guest.id === guestId);
+    if (index < 0) throw new StoreError('bracket_guest_not_found', 'Guest entry not found.');
+    guests.splice(index, 1);
+    this.audit.push({ actorId, action: 'tournament.guest_remove', targetId: `${eventId}:${occurrenceStart}` });
+  }
+
+  async recordBracketWinner(
+    actorId: string,
+    eventId: string,
+    occurrenceStart: string,
+    _matchId: string,
+    winnerEntrantId: string,
+  ): Promise<TournamentBracket> {
+    const current = await this.getEventBracket(eventId, occurrenceStart);
+    const bracket = { ...current, status: 'completed' as const, championEntrantId: winnerEntrantId };
+    this.brackets.set(`${eventId}:${occurrenceStart}`, bracket);
+    this.audit.push({ actorId, action: 'tournament.match_winner', targetId: `${eventId}:${occurrenceStart}` });
+    return bracket;
   }
 
   async listEventAttendees(
@@ -736,16 +884,17 @@ test('staff and admin routes enforce roles, return limited data, and audit admin
   assert.equal(search.json<{ users: unknown[]; total: number }>().total, 3);
   assert.equal(JSON.stringify(search.json()).includes('passwordHash'), false);
 
+  const tastingOccurrence = store.events[0].startsAt;
   const rsvp = await app.inject({
     method: 'POST',
     url: '/api/events/tasting/rsvp',
     headers: memberAuth,
-    payload: { occurrenceStart: '2026-11-14T16:00:00.000Z' },
+    payload: { occurrenceStart: tastingOccurrence },
   });
   assert.equal(rsvp.statusCode, 201);
   const attendees = await app.inject({
     method: 'GET',
-    url: '/api/admin/events/tasting/attendees?occurrenceStart=2026-11-14T16%3A00%3A00.000Z',
+    url: `/api/admin/events/tasting/attendees?occurrenceStart=${encodeURIComponent(tastingOccurrence)}`,
     headers: staffAuth,
   });
   assert.equal(attendees.statusCode, 200);
@@ -753,6 +902,68 @@ test('staff and admin routes enforce roles, return limited data, and audit admin
   assert.equal(attendeeData.total, 1);
   assert.equal(attendeeData.attendees[0].name, 'RBAC Member');
   assert.equal('email' in attendeeData.attendees[0], false);
+  const guest = await app.inject({
+    method: 'POST',
+    url: '/api/admin/events/tasting/bracket/guests',
+    headers: staffAuth,
+    payload: { occurrenceStart: tastingOccurrence, name: 'Guest Player' },
+  });
+  assert.equal(guest.statusCode, 200);
+  const guestList = await app.inject({
+    method: 'GET',
+    url: `/api/admin/events/tasting/bracket/guests?occurrenceStart=${encodeURIComponent(tastingOccurrence)}`,
+    headers: staffAuth,
+  });
+  assert.equal(guestList.statusCode, 200);
+  assert.equal(guestList.json<{ guests: Array<{ name: string }> }>().guests[0].name, 'Guest Player');
+  const memberBracket = await app.inject({
+    method: 'GET',
+    url: `/api/events/tasting/bracket?occurrenceStart=${encodeURIComponent(tastingOccurrence)}`,
+    headers: memberAuth,
+  });
+  assert.equal(memberBracket.statusCode, 200);
+  assert.equal(memberBracket.json<{ bracket: TournamentBracket }>().bracket.entrants.length, 0);
+  assert.equal(memberBracket.json<{ bracket: TournamentBracket }>().bracket.participantCount, 2);
+  assert.equal(JSON.stringify(memberBracket.json()).includes('Guest Player'), false);
+  assert.equal((await app.inject({
+    method: 'POST',
+    url: '/api/admin/events/tasting/bracket/draw',
+    headers: memberAuth,
+    payload: { occurrenceStart: tastingOccurrence },
+  })).statusCode, 403);
+  const earlyDraw = await app.inject({
+    method: 'POST',
+    url: '/api/admin/events/tasting/bracket/draw',
+    headers: staffAuth,
+    payload: { occurrenceStart: tastingOccurrence },
+  });
+  assert.equal(earlyDraw.statusCode, 409);
+
+  const closedOccurrence = new Date(Date.now() - 1_000).toISOString();
+  const rsvps = store.rsvps.get(`tasting:${tastingOccurrence}`);
+  const guestEntries = store.guests.get(`tasting:${tastingOccurrence}`);
+  store.rsvps.delete(`tasting:${tastingOccurrence}`);
+  store.guests.delete(`tasting:${tastingOccurrence}`);
+  store.rsvps.set(`tasting:${closedOccurrence}`, rsvps ?? new Set());
+  store.guests.set(`tasting:${closedOccurrence}`, guestEntries ?? []);
+  store.events[0].startsAt = closedOccurrence;
+  const finalizedBracket = await app.inject({
+    method: 'GET',
+    url: `/api/events/tasting/bracket?occurrenceStart=${encodeURIComponent(closedOccurrence)}`,
+    headers: memberAuth,
+  });
+  assert.equal(finalizedBracket.statusCode, 200);
+  const visibleBracket = finalizedBracket.json<{ bracket: TournamentBracket }>().bracket;
+  assert.equal(visibleBracket.status, 'drawn');
+  assert.deepEqual(visibleBracket.entrants.map(entrant => entrant.name).sort(), ['Guest Player', 'RBAC Member']);
+  const bracketDraw = await app.inject({
+    method: 'POST',
+    url: '/api/admin/events/tasting/bracket/draw',
+    headers: staffAuth,
+    payload: { occurrenceStart: closedOccurrence },
+  });
+  assert.equal(bracketDraw.statusCode, 200);
+  assert.equal(bracketDraw.json<{ bracket: TournamentBracket }>().bracket.status, 'drawn');
   assert.equal((await app.inject({ method: 'GET', url: '/api/admin/events', headers: staffAuth })).statusCode, 403);
 
   const eventInput = {
@@ -774,6 +985,7 @@ test('staff and admin routes enforce roles, return limited data, and audit admin
   assert.equal(createdEvent.statusCode, 201);
   const eventId = createdEvent.json<{ event: EventRecord }>().event.id;
   assert.notEqual(eventId, 'client-controlled-id');
+  assert.equal(createdEvent.json<{ event: EventRecord }>().event.bracketEnabled, false);
   const eventOccurrence = '2027-01-01T10:00:00.000Z';
   const rsvpCreated = await app.inject({
     method: 'POST',

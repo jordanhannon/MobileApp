@@ -113,6 +113,22 @@ migration first with `npm run migrate --prefix server`.
   accounts, view attendee names and RSVP times,
   and review points reports. Admins can also manage events and rewards and
   assign roles. Point adjustment and account suspension are not available.
+- Admins can enable tournament brackets per event series; the setting defaults
+  off. For enabled series, each occurrence accepts member RSVPs and staff-entered
+  guest players until its scheduled start, regardless of the series-wide RSVP
+  toggle. Guests count toward capacity and the bracket roster. A server-side
+  sweep, with request-time catch-up, freezes the roster and randomizes the
+  single-elimination bracket at that cutoff. Finalization is transaction-locked
+  and idempotent, so restarts and concurrent requests do not create duplicate
+  draws.
+- Before the cutoff, members see the event time, cutoff/countdown, and participant
+  count only; entrant names and matchups remain hidden. Staff and admins can add
+  or remove guest names before the cutoff. Once drawn, the active bracket remains
+  visible until staff records all winners and the tournament completes, then the
+  Bracket tab automatically selects the next upcoming enabled occurrence. Guest
+  players use stable entrant IDs and can advance through matches without app
+  accounts. Because the configured cutoff is event start, members see the draw
+  when the event begins rather than in advance.
 - To provision the first admin, connect to PostgreSQL with an authorized
   database administrator and promote a verified account:
 

@@ -1,7 +1,7 @@
 import type {
-  Account, AdminReward, AdminUser, EventAttendee, EventInput, EventRecord, MemberEvent,
+  Account, AdminReward, AdminUser, BracketGuest, BracketMatch, EventAttendee, EventInput, EventRecord, MemberEvent,
   PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, SocialIdentityInput,
-  SocialIdentityProvider, SocialIdentityResult, UserRecord, UserRole,
+  SocialIdentityProvider, SocialIdentityResult, TournamentBracket, UserRecord, UserRole,
 } from './domain.js';
 
 export type EmailTokenPurpose = 'verify_email' | 'reset_password';
@@ -36,6 +36,19 @@ export interface Store {
   listEvents(userId: string): Promise<MemberEvent[]>;
   rsvpToEvent(userId: string, eventId: string, occurrenceStart: string): Promise<'rsvped' | 'already_rsvped'>;
   cancelEventRsvp(userId: string, eventId: string, occurrenceStart: string): Promise<boolean>;
+  getEventBracket(eventId: string, occurrenceStart: string): Promise<TournamentBracket>;
+  finalizeDueBrackets(): Promise<void>;
+  drawEventBracket(actorId: string | null, eventId: string, occurrenceStart: string): Promise<TournamentBracket>;
+  listBracketGuests(eventId: string, occurrenceStart: string): Promise<BracketGuest[]>;
+  addBracketGuest(actorId: string, eventId: string, occurrenceStart: string, name: string): Promise<BracketGuest>;
+  removeBracketGuest(actorId: string, eventId: string, occurrenceStart: string, guestId: string): Promise<void>;
+  recordBracketWinner(
+    actorId: string,
+    eventId: string,
+    occurrenceStart: string,
+    matchId: string,
+    winnerEntrantId: string,
+  ): Promise<TournamentBracket>;
   listEventAttendees(eventId: string, occurrenceStart: string, limit: number, offset: number): Promise<{
     event: EventRecord;
     total: number;

@@ -15,10 +15,12 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
   const userId = randomUUID();
   const adminId = randomUUID();
   const socialUserId = randomUUID();
+  const lateUserId = randomUUID();
   const email = `integration-${userId}@example.test`;
   const adminEmail = `integration-admin-${adminId}@example.test`;
   const eventId = `integration-${userId.slice(0, 8)}`;
   const monthlyEventId = `monthly-${userId.slice(0, 8)}`;
+  const bracketEventId = `bracket-${userId.slice(0, 8)}`;
   const rewardId = `integration-${userId.slice(0, 8)}`;
   const socialNonceHashes: string[] = [];
   const tokenHash = () => randomBytes(32).toString('hex');
@@ -176,6 +178,7 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
       tag: 'TEST',
       capacity: 1,
       rsvpOpen: true,
+      bracketEnabled: false,
       recurrence: 'weekly',
       recurrenceUntil: null,
     });
@@ -215,6 +218,7 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
         tag: 'TEST',
         capacity: 1,
         rsvpOpen: true,
+        bracketEnabled: false,
         recurrence: 'weekly',
         recurrenceUntil: null,
       }),
@@ -229,12 +233,111 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
       tag: 'TEST',
       capacity: 1,
       rsvpOpen: false,
+      bracketEnabled: false,
       recurrence: 'weekly',
       recurrenceUntil: null,
     });
     assert.equal((await store.listAdminEvents()).find(item => item.id === eventId)?.rsvpOpen, false);
     await store.archiveEvent(adminId, eventId);
     assert.equal((await store.listAdminEvents()).find(item => item.id === eventId)?.active, false);
+
+    await store.createUser(lateUserId, 'Late Bracket Member', `late-bracket-${lateUserId}@example.test`, 'argon2-hash');
+    let bracketOccurrence = new Date(Date.now() + 60 * 60_000).toISOString();
+    await store.createEvent(adminId, {
+      id: bracketEventId,
+      title: 'Weekly Pool Tournament',
+      startsAt: bracketOccurrence,
+      description: 'Occurrence-specific pool bracket test.',
+      tag: 'POOL',
+      capacity: 4,
+      rsvpOpen: false,
+      bracketEnabled: true,
+      recurrence: 'weekly',
+      recurrenceUntil: null,
+    });
+    await Promise.all([
+      store.rsvpToEvent(userId, bracketEventId, bracketOccurrence),
+      store.rsvpToEvent(adminId, bracketEventId, bracketOccurrence),
+      store.rsvpToEvent(socialUserId, bracketEventId, bracketOccurrence),
+    ]);
+    const guest = await store.addBracketGuest(adminId, bracketEventId, bracketOccurrence, 'App-less Guest');
+    await assert.rejects(
+      () => store.addBracketGuest(adminId, bracketEventId, bracketOccurrence, 'Over-capacity Guest'),
+      { code: 'event_full' },
+    );
+    const beforeDraw = await store.getEventBracket(bracketEventId, bracketOccurrence);
+    assert.equal(beforeDraw.status, 'not_started');
+    assert.equal(beforeDraw.participantCount, 4);
+    assert.equal(beforeDraw.entrants.length, 0);
+    assert.equal((await store.listBracketGuests(bracketEventId, bracketOccurrence))[0].id, guest.id);
+
+    const closedOccurrence = new Date(Date.now() - 1_000).toISOString();
+    await pool.query('UPDATE events SET starts_at = $1 WHERE id = $2', [closedOccurrence, bracketEventId]);
+    await pool.query(
+      'UPDATE event_rsvps SET occurrence_start = $1 WHERE event_id = $2 AND occurrence_start = $3',
+      [closedOccurrence, bracketEventId, bracketOccurrence],
+    );
+    await pool.query(
+      'UPDATE event_bracket_guests SET occurrence_start = $1 WHERE event_id = $2 AND occurrence_start = $3',
+      [closedOccurrence, bracketEventId, bracketOccurrence],
+    );
+    bracketOccurrence = closedOccurrence;
+    await assert.rejects(
+      () => store.rsvpToEvent(lateUserId, bracketEventId, bracketOccurrence),
+      { code: 'rsvp_closed' },
+    );
+
+    await Promise.all([store.finalizeDueBrackets(), store.finalizeDueBrackets()]);
+    const firstDraw = await store.getEventBracket(bracketEventId, bracketOccurrence);
+    assert.equal(firstDraw.status, 'drawn');
+    assert.equal(firstDraw.participantCount, 4);
+    assert.ok(firstDraw.entrants.some(entrant => entrant.entrantId === guest.id && entrant.userId === null));
+    const activeOccurrence = (await store.listEvents(userId))
+      .find(item => item.id === bracketEventId && item.occurrenceStart === bracketOccurrence);
+    assert.equal(activeOccurrence?.bracketStatus, 'drawn');
+    assert.equal(activeOccurrence?.bracketParticipantCount, 4);
+    assert.deepEqual(firstDraw.rounds.map(round => round.length), [2, 1]);
+    assert.ok(firstDraw.rounds[0].every(match => match.playerOne && match.playerTwo));
+
+    const guestMatch = firstDraw.rounds[0].find(match =>
+      match.playerOne?.entrantId === guest.id || match.playerTwo?.entrantId === guest.id);
+    assert.ok(guestMatch);
+    const afterGuestWin = await store.recordBracketWinner(
+      adminId, bracketEventId, bracketOccurrence, guestMatch.id, guest.id,
+    );
+    assert.ok(afterGuestWin.rounds[1][0].playerOne?.entrantId === guest.id ||
+      afterGuestWin.rounds[1][0].playerTwo?.entrantId === guest.id);
+
+    const otherMatch = firstDraw.rounds[0].find(match => match.id !== guestMatch.id);
+    assert.ok(otherMatch?.playerOne);
+    const afterOtherWin = await store.recordBracketWinner(
+      adminId, bracketEventId, bracketOccurrence, otherMatch.id, otherMatch.playerOne.entrantId,
+    );
+    const finalMatch = afterOtherWin.rounds[1][0];
+    assert.ok(finalMatch.playerOne);
+    assert.ok(finalMatch.playerTwo);
+    const completed = await store.recordBracketWinner(
+      adminId, bracketEventId, bracketOccurrence, finalMatch.id, finalMatch.playerTwo.entrantId,
+    );
+    assert.equal(completed.status, 'completed');
+    assert.equal(completed.championEntrantId, finalMatch.playerTwo.entrantId);
+    assert.equal((await store.drawEventBracket(adminId, bracketEventId, bracketOccurrence)).status, 'completed');
+    assert.equal((await store.listEvents(userId)).some(item =>
+      item.id === bracketEventId && item.occurrenceStart === bracketOccurrence), false);
+
+    const nextOccurrenceResult = await pool.query<{ occurrence_start: Date }>(
+      `SELECT (
+         (($1::TIMESTAMPTZ AT TIME ZONE 'America/New_York') + INTERVAL '1 week')
+         AT TIME ZONE 'America/New_York'
+       ) AS occurrence_start`,
+      [bracketOccurrence],
+    );
+    const nextBracketOccurrence = nextOccurrenceResult.rows[0].occurrence_start.toISOString();
+    await store.rsvpToEvent(userId, bracketEventId, nextBracketOccurrence);
+    const independentOccurrence = await store.getEventBracket(bracketEventId, nextBracketOccurrence);
+    assert.equal(independentOccurrence.status, 'not_started');
+    assert.equal(independentOccurrence.participantCount, 1);
+    assert.equal(independentOccurrence.entrants.length, 0);
 
     await store.createEvent(adminId, {
       id: monthlyEventId,
@@ -244,6 +347,7 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
       tag: 'TEST',
       capacity: null,
       rsvpOpen: true,
+      bracketEnabled: false,
       recurrence: 'monthly',
       recurrenceUntil: '2027-04-30',
     });
@@ -298,13 +402,21 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
     assert.ok(Number(audit.rows[0].total) >= 7);
   } finally {
     await pool.query('DELETE FROM admin_audit_log WHERE actor_user_id = ANY($1::UUID[])', [[userId, adminId]]);
+    await pool.query(
+      'DELETE FROM admin_audit_log WHERE target_type = $1 AND target_id LIKE $2',
+      ['event_occurrence', `${bracketEventId}:%`],
+    );
+    await pool.query('DELETE FROM tournament_brackets WHERE event_id = $1', [bracketEventId]);
+    await pool.query('DELETE FROM event_bracket_guests WHERE event_id = $1', [bracketEventId]);
+    await pool.query('DELETE FROM event_rsvps WHERE event_id = $1', [bracketEventId]);
+    await pool.query('DELETE FROM events WHERE id = $1', [bracketEventId]);
     await pool.query('DELETE FROM event_rsvps WHERE event_id = $1', [eventId]);
     await pool.query('DELETE FROM events WHERE id = $1', [eventId]);
     await pool.query('DELETE FROM event_rsvps WHERE event_id = $1', [monthlyEventId]);
     await pool.query('DELETE FROM events WHERE id = $1', [monthlyEventId]);
     await pool.query('DELETE FROM rewards WHERE id = $1', [rewardId]);
     await pool.query('DELETE FROM auth_provider_nonces WHERE nonce_hash = ANY($1::TEXT[])', [socialNonceHashes]);
-    await pool.query('DELETE FROM users WHERE id = ANY($1::UUID[])', [[userId, adminId, socialUserId]]);
+    await pool.query('DELETE FROM users WHERE id = ANY($1::UUID[])', [[userId, adminId, socialUserId, lateUserId]]);
     await pool.end();
   }
 });

@@ -13,15 +13,17 @@ import {
 import { beginAppleSignIn, beginGoogleSignIn } from './socialSignIn';
 import { fetchRewards, redeemReward as submitRewardRedemption, Reward } from './rewardsApi';
 import StaffDashboard from './StaffDashboard';
+import TournamentBrackets from './TournamentBrackets';
 import { cancelEventRsvp, fetchEvents, rsvpToEvent, type AppEvent } from './eventsApi';
 import { EVENT_TIME_ZONE } from './easternDateTime';
 
-type Tab = 'Events' | 'Menu' | 'Rewards' | 'Staff';
+type Tab = 'Events' | 'Bracket' | 'Menu' | 'Rewards' | 'Staff';
 type Category = 'All' | 'Food' | 'Drinks';
 type AuthMode = 'login' | 'signup' | 'verify' | 'forgot' | 'reset' | 'social_profile';
 
 const tabs: { name: Tab; icon: string }[] = [
   { name: 'Events', icon: '◷' },
+  { name: 'Bracket', icon: '▦' },
   { name: 'Menu', icon: '☷' },
   { name: 'Rewards', icon: '☆' },
 ];
@@ -573,14 +575,16 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
           <Text style={styles.eyebrow}>YOUR NEIGHBORHOOD, REWARDED</Text>
           <Text accessibilityRole="header" style={styles.title}>
             {tab === 'Events' ? 'Good things are happening.'
-              : tab === 'Menu' ? 'Fresh favorites, made for you.'
-                : tab === 'Rewards' ? 'A little thank you, from us.' : 'Staff workspace.'}
+              : tab === 'Bracket' ? 'Let the games begin.'
+                : tab === 'Menu' ? 'Fresh favorites, made for you.'
+                  : tab === 'Rewards' ? 'A little thank you, from us.' : 'Staff workspace.'}
           </Text>
           <Text style={styles.subtitle}>
             {tab === 'Events' ? 'Pull up a chair. There’s always something to look forward to.'
-              : tab === 'Menu' ? 'Simple ingredients. Thoughtful flavors. Find your next favorite.'
-                : tab === 'Rewards' ? 'Every visit brings you closer to something delicious.'
-                  : 'Member support, event operations, and program reporting.'}
+              : tab === 'Bracket' ? 'Weekly pool tournament brackets, linked to event RSVPs.'
+                : tab === 'Menu' ? 'Simple ingredients. Thoughtful flavors. Find your next favorite.'
+                  : tab === 'Rewards' ? 'Every visit brings you closer to something delicious.'
+                    : 'Member support, event operations, and program reporting.'}
           </Text>
 
           {notice !== '' && (
@@ -651,6 +655,8 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
               })}
             </>
           )}
+
+          {tab === 'Bracket' && <TournamentBrackets account={account} />}
 
           {tab === 'Menu' && (
             <>

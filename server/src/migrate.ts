@@ -11,6 +11,8 @@ const migrations = [
   ['002_rbac_events', '002_rbac_events.sql'],
   ['003_recurring_events', '003_recurring_events.sql'],
   ['004_social_auth', '004_social_auth.sql'],
+  ['005_tournament_brackets', '005_tournament_brackets.sql'],
+  ['006_bracket_cutoffs_guests', '006_bracket_cutoffs_guests.sql'],
 ] as const;
 
 try {

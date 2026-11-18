@@ -52,6 +52,7 @@ export type EventRecord = {
   tag: string;
   capacity: number | null;
   rsvpOpen: boolean;
+  bracketEnabled: boolean;
   recurrence: 'none' | 'weekly' | 'monthly';
   recurrenceUntil: string | null;
   active: boolean;
@@ -60,7 +61,9 @@ export type EventRecord = {
 export type MemberEvent = EventRecord & {
   occurrenceStart: string;
   attendeeCount: number;
+  bracketParticipantCount: number;
   reserved: boolean;
+  bracketStatus: 'drawn' | 'completed' | null;
 };
 
 export type EventInput = Omit<EventRecord, 'active'>;
@@ -69,6 +72,46 @@ export type EventAttendee = {
   userId: string;
   name: string;
   rsvpAt: string;
+};
+
+export type BracketEntrant = {
+  entrantId: string;
+  userId: string | null;
+  name: string;
+  status: 'active' | 'waitlisted';
+};
+
+export type BracketPlayer = {
+  entrantId: string;
+  userId: string | null;
+  name: string;
+};
+
+export type BracketMatch = {
+  id: string;
+  roundNumber: number;
+  matchNumber: number;
+  playerOne: BracketPlayer | null;
+  playerTwo: BracketPlayer | null;
+  winnerEntrantId: string | null;
+};
+
+export type TournamentBracket = {
+  eventId: string;
+  occurrenceStart: string;
+  cutoffAt: string;
+  participantCount: number;
+  status: 'not_started' | 'drawn' | 'completed';
+  randomizedAt: string | null;
+  entrants: BracketEntrant[];
+  rounds: BracketMatch[][];
+  championEntrantId: string | null;
+};
+
+export type BracketGuest = {
+  id: string;
+  name: string;
+  createdAt: string;
 };
 
 export type AdminUser = Account & {

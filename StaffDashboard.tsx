@@ -26,6 +26,7 @@ const emptyEvent: EventDraft = {
   tag: '',
   capacity: '',
   rsvpOpen: true,
+  bracketEnabled: false,
   recurrence: 'none',
   recurrenceUntil: '',
 };
@@ -221,6 +222,7 @@ export default function StaffDashboard({ account }: { account: Account }) {
       tag: event.tag,
       capacity: event.capacity === null ? '' : String(event.capacity),
       rsvpOpen: event.rsvpOpen,
+      bracketEnabled: event.bracketEnabled,
       recurrence: event.recurrence,
       recurrenceUntil: event.recurrenceUntil ?? '',
     });
@@ -437,7 +439,21 @@ export default function StaffDashboard({ account }: { account: Account }) {
                 </>
               )}
             </View>
-            <ActionButton label={`RSVPs ${eventDraft.rsvpOpen ? 'open' : 'closed'} · Toggle`} onPress={() => setEventDraft(current => ({ ...current, rsvpOpen: !current.rsvpOpen }))} />
+            <ActionButton
+              label={`Tournament bracket ${eventDraft.bracketEnabled ? 'enabled' : 'disabled'} · Toggle`}
+              selected={eventDraft.bracketEnabled}
+              onPress={() => setEventDraft(current => ({ ...current, bracketEnabled: !current.bracketEnabled }))}
+            />
+            {eventDraft.bracketEnabled ? (
+              <Text style={styles.muted}>
+                RSVPs and guest entries close automatically at each occurrence’s start. The RSVP toggle does not apply to bracket events.
+              </Text>
+            ) : (
+              <ActionButton
+                label={`RSVPs ${eventDraft.rsvpOpen ? 'open' : 'closed'} · Toggle`}
+                onPress={() => setEventDraft(current => ({ ...current, rsvpOpen: !current.rsvpOpen }))}
+              />
+            )}
             <ActionButton label={editingEventId ? 'Save event' : 'Create event'} disabled={pending} onPress={() => void saveEvent()} />
             {editingEventId !== '' && <ActionButton label="Cancel edit" onPress={() => { setEditingEventId(''); setEventDraft(emptyEvent); }} />}
           </View>
@@ -448,6 +464,7 @@ export default function StaffDashboard({ account }: { account: Account }) {
                 <Text style={styles.cardTitle}>{event.title}</Text>
                 <Text style={styles.muted}>
                   {event.active ? 'Active' : 'Archived'} · {event.rsvpOpen ? 'RSVPs open' : 'RSVPs closed'}
+                  {' · '}{event.bracketEnabled ? 'Bracket enabled' : 'Bracket disabled'}
                   {' · '}{event.recurrence === 'none' ? 'One-time' : `Repeats ${event.recurrence}`}
                   {' · '}{formatEasternDateTime(event.startsAt)}
                   {event.recurrenceUntil ? ` · Through ${event.recurrenceUntil}` : ''}

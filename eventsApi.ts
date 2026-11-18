@@ -9,10 +9,13 @@ export type AppEvent = {
   tag: string;
   capacity: number | null;
   rsvpOpen: boolean;
+  bracketEnabled: boolean;
+  bracketStatus: 'drawn' | 'completed' | null;
   recurrence: 'none' | 'weekly' | 'monthly';
   recurrenceUntil: string | null;
   active: boolean;
   attendeeCount: number;
+  bracketParticipantCount: number;
   reserved: boolean;
 };
 

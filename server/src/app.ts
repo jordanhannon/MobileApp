@@ -157,6 +157,9 @@ function eventInput(body: Record<string, unknown>, id: string): EventInput {
   if (typeof body.rsvpOpen !== 'boolean') {
     throw new ApiError(400, 'invalid_request', 'Invalid RSVP status.');
   }
+  if (body.bracketEnabled !== undefined && typeof body.bracketEnabled !== 'boolean') {
+    throw new ApiError(400, 'invalid_request', 'Invalid bracket setting.');
+  }
   if (recurrence !== 'none' && recurrence !== 'weekly' && recurrence !== 'monthly') {
     throw new ApiError(400, 'invalid_request', 'Invalid event recurrence.');
   }
@@ -183,6 +186,7 @@ function eventInput(body: Record<string, unknown>, id: string): EventInput {
     tag: stringField(body, 'tag', 1, 60).trim(),
     capacity,
     rsvpOpen: body.rsvpOpen,
+    bracketEnabled: body.bracketEnabled === true,
     recurrence,
     recurrenceUntil,
   };
@@ -507,7 +511,110 @@ export function createApp({ config, store, emailSender, socialTokenVerifier = ne
 
   app.get('/api/events', { preHandler: requireAccount }, async request => {
     if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    await store.finalizeDueBrackets();
     return { events: await store.listEvents(request.account.id) };
+  });
+
+  app.get('/api/events/:eventId/bracket', { preHandler: requireAccount }, async request => {
+    const eventId = slugParameter(routeParameter(request, 'eventId', 80));
+    const query = bodyRecord(request.query);
+    const occurrenceStart = new Date(stringField(query, 'occurrenceStart', 1, 40));
+    if (!Number.isFinite(occurrenceStart.getTime())) {
+      throw new ApiError(400, 'invalid_request', 'Invalid event occurrence.');
+    }
+    await store.finalizeDueBrackets();
+    return {
+      bracket: await store.getEventBracket(eventId, occurrenceStart.toISOString()),
+    };
+  });
+
+  app.get('/api/admin/events/:eventId/bracket/guests', {
+    preHandler: requireRole('staff', 'admin'),
+  }, async request => {
+    const eventId = slugParameter(routeParameter(request, 'eventId', 80));
+    const query = bodyRecord(request.query);
+    const occurrenceStart = new Date(stringField(query, 'occurrenceStart', 1, 40));
+    if (!Number.isFinite(occurrenceStart.getTime())) {
+      throw new ApiError(400, 'invalid_request', 'Invalid event occurrence.');
+    }
+    return {
+      guests: await store.listBracketGuests(eventId, occurrenceStart.toISOString()),
+    };
+  });
+
+  app.post('/api/admin/events/:eventId/bracket/guests', {
+    preHandler: requireRole('staff', 'admin'),
+  }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const eventId = slugParameter(routeParameter(request, 'eventId', 80));
+    const body = bodyRecord(request.body);
+    const occurrenceStart = new Date(stringField(body, 'occurrenceStart', 1, 40));
+    if (!Number.isFinite(occurrenceStart.getTime())) {
+      throw new ApiError(400, 'invalid_request', 'Invalid event occurrence.');
+    }
+    const name = stringField(body, 'name', 1, 120).trim();
+    if (!name) throw new ApiError(400, 'invalid_request', 'Guest name is required.');
+    return {
+      guest: await store.addBracketGuest(
+        request.account.id,
+        eventId,
+        occurrenceStart.toISOString(),
+        name,
+      ),
+    };
+  });
+
+  app.post('/api/admin/events/:eventId/bracket/guests/:guestId/remove', {
+    preHandler: requireRole('staff', 'admin'),
+  }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const eventId = slugParameter(routeParameter(request, 'eventId', 80));
+    const guestId = uuidParameter(routeParameter(request, 'guestId', 36));
+    const body = bodyRecord(request.body);
+    const occurrenceStart = new Date(stringField(body, 'occurrenceStart', 1, 40));
+    if (!Number.isFinite(occurrenceStart.getTime())) {
+      throw new ApiError(400, 'invalid_request', 'Invalid event occurrence.');
+    }
+    await store.removeBracketGuest(request.account.id, eventId, occurrenceStart.toISOString(), guestId);
+    return { removed: true };
+  });
+
+  app.post('/api/admin/events/:eventId/bracket/draw', {
+    preHandler: requireRole('staff', 'admin'),
+  }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const eventId = slugParameter(routeParameter(request, 'eventId', 80));
+    const body = bodyRecord(request.body);
+    const occurrenceStart = new Date(stringField(body, 'occurrenceStart', 1, 40));
+    if (!Number.isFinite(occurrenceStart.getTime())) {
+      throw new ApiError(400, 'invalid_request', 'Invalid event occurrence.');
+    }
+    return {
+      bracket: await store.drawEventBracket(request.account.id, eventId, occurrenceStart.toISOString()),
+    };
+  });
+
+  app.post('/api/admin/events/:eventId/bracket/matches/:matchId/winner', {
+    preHandler: requireRole('staff', 'admin'),
+  }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const eventId = slugParameter(routeParameter(request, 'eventId', 80));
+    const matchId = uuidParameter(routeParameter(request, 'matchId', 36));
+    const body = bodyRecord(request.body);
+    const occurrenceStart = new Date(stringField(body, 'occurrenceStart', 1, 40));
+    if (!Number.isFinite(occurrenceStart.getTime())) {
+      throw new ApiError(400, 'invalid_request', 'Invalid event occurrence.');
+    }
+    const winnerEntrantId = uuidParameter(stringField(body, 'winnerEntrantId', 1, 36));
+    return {
+      bracket: await store.recordBracketWinner(
+        request.account.id,
+        eventId,
+        occurrenceStart.toISOString(),
+        matchId,
+        winnerEntrantId,
+      ),
+    };
   });
 
   app.post('/api/events/:eventId/rsvp', { preHandler: requireAccount }, async (request, reply) => {
