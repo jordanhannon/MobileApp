@@ -32,7 +32,7 @@ type ErrorResponse = {
 };
 
 type ApiRequestOptions = {
-  method?: 'GET' | 'POST';
+  method?: 'GET' | 'POST' | 'DELETE';
   body?: unknown;
   headers?: Record<string, string>;
   retryAuth?: boolean;

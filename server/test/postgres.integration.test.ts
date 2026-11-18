@@ -22,6 +22,7 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
   const pastEventId = `past-${userId.slice(0, 8)}`;
   const monthlyEventId = `monthly-${userId.slice(0, 8)}`;
   const bracketEventId = `bracket-${userId.slice(0, 8)}`;
+  const reminderEventId = `reminder-${userId.slice(0, 8)}`;
   const rewardId = `integration-${userId.slice(0, 8)}`;
   const socialNonceHashes: string[] = [];
   const tokenHash = () => randomBytes(32).toString('hex');
@@ -33,6 +34,16 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
     const admin = await store.createUser(adminId, 'Integration Admin', adminEmail, 'argon2-hash');
     assert.ok(admin);
     await pool.query('UPDATE users SET role = $2 WHERE id = $1', [adminId, 'admin']);
+    assert.deepEqual(await store.getNotificationPreferences(userId), {
+      rsvpUpdatesEnabled: true,
+      eventChangesEnabled: true,
+      rewardsEnabled: true,
+      announcementsEnabled: true,
+      pushEnabled: true,
+      reminderSchedule: '24h',
+    });
+    const expoToken = `ExponentPushToken[${randomUUID()}]`;
+    await store.registerPushToken(userId, expoToken, 'ios');
     assert.equal(await store.createUser(randomUUID(), 'Duplicate', email.toUpperCase(), 'hash'), null);
     assert.equal((await store.findUserByEmail(email))?.id, userId);
 
@@ -140,6 +151,14 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
        VALUES ($1, $2, $3, 'admin_credit')`,
       [randomUUID(), userId, 250],
     );
+    const pointsNotifications = await store.listNotifications(userId, 10, 0);
+    assert.ok(pointsNotifications.items.some(item => item.type === 'points_earned'));
+    assert.ok(pointsNotifications.unreadCount > 0);
+    const queuedPointPushes = await store.claimPushDeliveries(10);
+    assert.ok(queuedPointPushes.some(item => item.token === expoToken));
+    if (queuedPointPushes[0]) {
+      await store.markPushDeliverySubmitted(queuedPointPushes[0].id, `test-ticket-${randomUUID()}`);
+    }
     const initialSummary = await store.getPointsSummary();
     assert.ok(initialSummary.totalUsers >= 2);
     assert.ok(initialSummary.totalPoints >= 250);
@@ -162,6 +181,7 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
     assert.equal(pastry.kind, 'redeemed');
     if (pastry.kind !== 'redeemed') return;
     assert.equal(pastry.balance, 0);
+    assert.ok((await store.listNotifications(userId, 10, 0)).items.some(item => item.type === 'reward_redeemed'));
 
     assert.deepEqual(await store.redeem(userId, 'lunch', 'integration-lunch'), {
       kind: 'insufficient_points',
@@ -183,6 +203,34 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
       recurrence: 'weekly',
       recurrenceUntil: null,
     });
+    const reminderStart = new Date(Date.now() + 30 * 60_000).toISOString();
+    await store.createEvent(adminId, {
+      id: reminderEventId,
+      title: 'Integration Reminder Event',
+      startsAt: reminderStart,
+      description: 'Reminder scheduling test.',
+      tag: 'TEST',
+      capacity: null,
+      rsvpOpen: true,
+      bracketEnabled: false,
+      recurrence: 'none',
+      recurrenceUntil: null,
+    });
+    await store.updateNotificationPreferences(userId, {
+      rsvpUpdatesEnabled: true,
+      eventChangesEnabled: true,
+      rewardsEnabled: true,
+      announcementsEnabled: true,
+      pushEnabled: true,
+      reminderSchedule: '1h',
+    });
+    await store.rsvpToEvent(userId, reminderEventId, reminderStart);
+    await store.enqueueDueEventReminders();
+    await store.enqueueDueEventReminders();
+    const reminderNotifications = (await store.listNotifications(userId, 50, 0)).items
+      .filter(item => item.type === 'event_reminder');
+    assert.equal(reminderNotifications.length, 1);
+
     const firstOccurrence = '2027-03-07T16:30:00.000Z';
     const secondOccurrence = '2027-03-14T15:30:00.000Z';
     const rsvpAttempts = await Promise.allSettled([
@@ -208,6 +256,22 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
     assert.equal(attendees.total, 1);
     assert.ok(['Integration Member', 'Integration Admin'].includes(attendees.attendees[0].name));
     assert.equal('email' in attendees.attendees[0], false);
+
+    const publishedAnnouncement = await store.createAnnouncement(
+      adminId,
+      'Integration announcement',
+      'This update is for the event attendees.',
+      { type: 'event', eventId, occurrenceStart: firstOccurrence },
+      'integration-announcement-key',
+    );
+    assert.deepEqual(publishedAnnouncement, { recipients: 1, alreadyApplied: false });
+    assert.deepEqual(await store.createAnnouncement(
+      adminId,
+      'Integration announcement',
+      'This update is for the event attendees.',
+      { type: 'event', eventId, occurrenceStart: firstOccurrence },
+      'integration-announcement-key',
+    ), { recipients: 1, alreadyApplied: true });
     const secondAttendees = await store.listEventAttendees(eventId, secondOccurrence, 10, 0);
     assert.equal(secondAttendees.total, 1);
 
@@ -423,6 +487,7 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
     assert.ok(Number(audit.rows[0].total) >= 7);
   } finally {
     await pool.query('DELETE FROM admin_audit_log WHERE actor_user_id = ANY($1::UUID[])', [[userId, adminId]]);
+    await pool.query('DELETE FROM staff_announcements WHERE actor_id = ANY($1::UUID[])', [[userId, adminId]]);
     await pool.query(
       'DELETE FROM admin_audit_log WHERE target_type = $1 AND target_id LIKE $2',
       ['event_occurrence', `${bracketEventId}:%`],
@@ -433,6 +498,8 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
     await pool.query('DELETE FROM events WHERE id = $1', [bracketEventId]);
     await pool.query('DELETE FROM event_rsvps WHERE event_id = $1', [eventId]);
     await pool.query('DELETE FROM events WHERE id = $1', [eventId]);
+    await pool.query('DELETE FROM event_rsvps WHERE event_id = $1', [reminderEventId]);
+    await pool.query('DELETE FROM events WHERE id = $1', [reminderEventId]);
     await pool.query('DELETE FROM events WHERE id = $1', [pastEventId]);
     await pool.query('DELETE FROM event_rsvps WHERE event_id = $1', [monthlyEventId]);
     await pool.query('DELETE FROM events WHERE id = $1', [monthlyEventId]);

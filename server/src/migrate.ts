@@ -13,6 +13,7 @@ const migrations = [
   ['004_social_auth', '004_social_auth.sql'],
   ['005_tournament_brackets', '005_tournament_brackets.sql'],
   ['006_bracket_cutoffs_guests', '006_bracket_cutoffs_guests.sql'],
+  ['007_notifications', '007_notifications.sql'],
 ] as const;
 
 try {

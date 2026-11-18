@@ -54,6 +54,10 @@ export type ManagedEventInput = {
 
 export type ManagedRewardInput = Omit<ManagedReward, 'id' | 'active'>;
 
+export type AnnouncementAudience =
+  | { type: 'all' }
+  | { type: 'event'; eventId: string; occurrenceStart: string };
+
 export async function searchUsers(
   query: string,
   page = 1,
@@ -66,6 +70,19 @@ export async function searchUsers(
 export async function fetchPointsSummary(): Promise<PointsSummary> {
   const response = await apiRequest<{ summary: PointsSummary }>('/admin/points');
   return response.summary;
+}
+
+export async function publishAnnouncement(
+  title: string,
+  body: string,
+  audience: AnnouncementAudience,
+  idempotencyKey: string,
+): Promise<{ recipients: number; alreadyApplied: boolean }> {
+  return apiRequest('/admin/announcements', {
+    method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
+    body: { title, body, audience },
+  });
 }
 
 export async function fetchUserPoints(userId: string): Promise<{ balance: number; entries: LedgerEntry[] }> {

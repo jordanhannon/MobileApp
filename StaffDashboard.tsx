@@ -12,8 +12,9 @@ import {
 } from './adminApi';
 import { fetchEvents, type AppEvent } from './eventsApi';
 import { useAppTheme } from './theme';
+import StaffAnnouncements from './StaffAnnouncements';
 
-type Section = 'Users' | 'RSVPs' | 'Points' | 'Events' | 'Manage';
+type Section = 'Users' | 'RSVPs' | 'Points' | 'Events' | 'Manage' | 'Announcements';
 type EventDraft = Omit<ManagedEventInput, 'capacity' | 'recurrenceUntil'> & {
   capacity: string;
   recurrenceUntil: string;
@@ -43,8 +44,8 @@ export default function StaffDashboard({ account }: { account: Account }) {
   const styles = useStaffStyles();
   const isAdmin = account.role === 'admin';
   const sections: Section[] = isAdmin
-    ? ['Users', 'RSVPs', 'Points', 'Manage']
-    : ['Users', 'RSVPs', 'Points', 'Events'];
+    ? ['Users', 'RSVPs', 'Points', 'Manage', 'Announcements']
+    : ['Users', 'RSVPs', 'Points', 'Events', 'Announcements'];
   const [section, setSection] = useState<Section>('Users');
   const [query, setQuery] = useState('');
   const [users, setUsers] = useState<StaffUser[]>([]);
@@ -517,6 +518,7 @@ export default function StaffDashboard({ account }: { account: Account }) {
           )}
         </>
       )}
+      {section === 'Announcements' && <StaffAnnouncements />}
     </View>
   );
 }

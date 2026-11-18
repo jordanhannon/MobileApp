@@ -132,6 +132,63 @@ export type PointsLedgerEntry = {
   createdAt: string;
 };
 
+export type NotificationType =
+  | 'rsvp_confirmed'
+  | 'rsvp_cancelled'
+  | 'event_reminder'
+  | 'event_changed'
+  | 'event_cancelled'
+  | 'points_earned'
+  | 'reward_redeemed'
+  | 'announcement';
+
+export type AppNotification = {
+  id: string;
+  type: NotificationType;
+  title: string;
+  body: string;
+  data: Record<string, string>;
+  createdAt: string;
+  readAt: string | null;
+};
+
+export type NotificationPage = {
+  items: AppNotification[];
+  total: number;
+  unreadCount: number;
+};
+
+export type NotificationPreferences = {
+  rsvpUpdatesEnabled: boolean;
+  eventChangesEnabled: boolean;
+  rewardsEnabled: boolean;
+  announcementsEnabled: boolean;
+  pushEnabled: boolean;
+  reminderSchedule: 'off' | '24h' | '1h' | '24h_1h';
+};
+
+export type PushPlatform = 'ios' | 'android';
+
+export type PushDelivery = {
+  id: string;
+  notificationId: string;
+  token: string;
+  title: string;
+  body: string;
+  data: Record<string, string>;
+  attemptCount: number;
+};
+
+export type ExpoReceipt = {
+  id: string;
+  ticketId: string;
+  attemptCount: number;
+};
+
+export type AnnouncementAudience =
+  | { type: 'all' }
+  | { type: 'event'; eventId: string; occurrenceStart: string };
+
 export type AdminReward = Reward & {
   active: boolean;
 };

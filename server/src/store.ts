@@ -1,5 +1,7 @@
 import type {
-  Account, AdminReward, AdminUser, BracketGuest, BracketMatch, EventAttendee, EventInput, EventRecord, MemberEvent,
+  Account, AdminReward, AdminUser, AnnouncementAudience, AppNotification, BracketGuest, BracketMatch,
+  EventAttendee, EventInput, EventRecord, ExpoReceipt, MemberEvent, NotificationPage,
+  NotificationPreferences, PushDelivery, PushPlatform,
   PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, SocialIdentityInput,
   SocialIdentityProvider, SocialIdentityResult, TournamentBracket, UserRecord, UserRole,
 } from './domain.js';
@@ -33,6 +35,29 @@ export interface Store {
   revokeSession(refreshTokenHash: string): Promise<void>;
   listRewards(): Promise<Reward[]>;
   redeem(userId: string, rewardId: string, idempotencyKey: string): Promise<RedemptionResult>;
+  listNotifications(userId: string, limit: number, offset: number): Promise<NotificationPage>;
+  markNotificationRead(userId: string, notificationId: string): Promise<boolean>;
+  markAllNotificationsRead(userId: string): Promise<number>;
+  getNotificationPreferences(userId: string): Promise<NotificationPreferences>;
+  updateNotificationPreferences(userId: string, preferences: NotificationPreferences): Promise<NotificationPreferences>;
+  registerPushToken(userId: string, token: string, platform: PushPlatform): Promise<void>;
+  revokePushToken(userId: string, token: string): Promise<void>;
+  createAnnouncement(
+    actorId: string,
+    title: string,
+    body: string,
+    audience: AnnouncementAudience,
+    idempotencyKey: string,
+  ): Promise<{ recipients: number; alreadyApplied: boolean }>;
+  enqueueDueEventReminders(): Promise<void>;
+  claimPushDeliveries(limit: number): Promise<PushDelivery[]>;
+  markPushDeliverySubmitted(deliveryId: string, ticketId: string): Promise<void>;
+  retryPushDelivery(deliveryId: string, error: string, delaySeconds: number): Promise<void>;
+  failPushDelivery(deliveryId: string, error: string, deactivateToken: boolean): Promise<void>;
+  listDueExpoReceipts(limit: number): Promise<ExpoReceipt[]>;
+  markExpoReceiptDelivered(deliveryId: string): Promise<void>;
+  markExpoReceiptFailed(deliveryId: string, error: string, deactivateToken: boolean): Promise<void>;
+  cleanupNotifications(): Promise<void>;
   listEvents(userId: string): Promise<MemberEvent[]>;
   listEventsForMonth(userId: string, monthStart: string): Promise<MemberEvent[]>;
   rsvpToEvent(userId: string, eventId: string, occurrenceStart: string): Promise<'rsvped' | 'already_rsvped'>;

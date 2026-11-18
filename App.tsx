@@ -1,6 +1,7 @@
 import { StatusBar } from 'expo-status-bar';
 import * as Crypto from 'expo-crypto';
 import * as AppleAuthentication from 'expo-apple-authentication';
+import * as Notifications from 'expo-notifications';
 import { useEffect, useMemo, useState } from 'react';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import {
@@ -18,8 +19,22 @@ import { cancelEventRsvp, fetchEvents, fetchEventsForMonth, rsvpToEvent, type Ap
 import { easternDatePart, EVENT_TIME_ZONE } from './easternDateTime';
 import { ThemeProvider, useAppTheme } from './theme';
 import EventsCalendar from './EventsCalendar';
+import { NotificationSettings, NotificationsInbox } from './NotificationsCenter';
+import {
+  fetchNotificationPreferences, fetchNotifications, markNotificationRead,
+  requestPushRegistration, revokeRegisteredPushToken,
+} from './notificationsApi';
 
-type Tab = 'Events' | 'Bracket' | 'Menu' | 'Rewards' | 'Staff';
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
+
+type Tab = 'Events' | 'Bracket' | 'Menu' | 'Rewards' | 'Notifications' | 'Settings' | 'Staff';
 type Category = 'All' | 'Food' | 'Drinks';
 type AuthMode = 'login' | 'signup' | 'verify' | 'forgot' | 'reset' | 'social_profile';
 type EventView = 'list' | 'calendar';
@@ -29,6 +44,7 @@ const tabs: { name: Tab; icon: string }[] = [
   { name: 'Bracket', icon: '▦' },
   { name: 'Menu', icon: '☷' },
   { name: 'Rewards', icon: '☆' },
+  { name: 'Settings', icon: '⚙' },
 ];
 const menu = [
   { id: 'bowl', name: 'Harvest bowl', description: 'Roasted vegetables, quinoa, greens & lemon tahini.', price: '$12.50', category: 'Food', icon: '🥗' },
@@ -470,6 +486,7 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
   } = useAppTheme();
   const styles = useAppStyles();
   const [tab, setTab] = useState<Tab>('Events');
+  const [notificationUnreadCount, setNotificationUnreadCount] = useState(0);
   const [category, setCategory] = useState<Category>('All');
   const [events, setEvents] = useState<AppEvent[]>([]);
   const [loadingEvents, setLoadingEvents] = useState(true);
@@ -509,6 +526,35 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
       : `${calendarMonth}-01`;
   const selectedDateEvents = monthEvents.filter(event =>
     easternDatePart(event.occurrenceStart) === selectedCalendarDate);
+
+  useEffect(() => {
+    let active = true;
+    fetchNotifications(1)
+      .then(result => { if (active) setNotificationUnreadCount(result.unreadCount); })
+      .catch(error => console.error('Unable to load the notification badge count.', error));
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    const subscription = Notifications.addNotificationResponseReceivedListener(response => {
+      const data = response.notification.request.content.data;
+      if (!data) return;
+      const destination = data.screen;
+      if (destination === 'Events' || destination === 'Rewards') {
+        navigateToNotification(destination, Object.fromEntries(
+          Object.entries(data).map(([key, value]) => [key, String(value)]),
+        ));
+      }
+      const notificationId = data.notificationId;
+      if (typeof notificationId === 'string') {
+        void markNotificationRead(notificationId)
+          .then(() => fetchNotifications(1))
+          .then(result => setNotificationUnreadCount(result.unreadCount))
+          .catch(error => console.error('Unable to mark the opened push notification as read.', error));
+      }
+    });
+    return () => subscription.remove();
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -564,16 +610,31 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
     const occurrenceKey = `${event.id}:${event.occurrenceStart}`;
     setRsvpPendingId(occurrenceKey);
     setNotice('');
+    let pushNotice = '';
     try {
       if (event.reserved) await cancelEventRsvp(event.id, event.occurrenceStart);
       else await rsvpToEvent(event.id, event.occurrenceStart);
+      if (!event.reserved) {
+        try {
+          const { pushEnabled } = await fetchNotificationPreferences();
+          if (pushEnabled) {
+            const result = await requestPushRegistration();
+            if (result === 'denied') {
+              pushNotice = 'You can still read updates in Notifications; allow push in Settings or your device settings to receive alerts.';
+            }
+          }
+        } catch (error) {
+          console.error('The RSVP was saved, but push registration failed.', error);
+          pushNotice = 'Push setup failed. You can retry from Settings.';
+        }
+      }
       const [upcoming, monthItems] = await Promise.all([
         fetchEvents(),
         eventView === 'calendar' ? fetchEventsForMonth(calendarMonth) : Promise.resolve(null),
       ]);
       setEvents(upcoming);
       if (monthItems) setCalendarEvents(monthItems);
-      setNotice(event.reserved ? 'Your RSVP was canceled.' : 'You’re on the guest list!');
+      setNotice(pushNotice || (event.reserved ? 'Your RSVP was canceled.' : 'You’re on the guest list!'));
     } catch (error) {
       console.error('Unable to update the event RSVP.', error);
       setNotice(error instanceof ApiError ? error.message : 'We could not update your RSVP. Please try again.');
@@ -604,6 +665,21 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
       setNotice(error instanceof ApiError ? error.message : 'We could not save this redemption. Please try again.');
     } finally {
       setRedeeming(false);
+    }
+  }
+
+  async function signOutMember() {
+    await revokeRegisteredPushToken();
+    await onSignOut();
+  }
+
+  function navigateToNotification(destination: 'Events' | 'Rewards', data: Record<string, string>) {
+    setTab(destination);
+    if (destination === 'Events' && data.occurrenceStart) {
+      const eventDate = easternDatePart(data.occurrenceStart);
+      setEventView('calendar');
+      setCalendarMonth(eventDate.slice(0, 7));
+      setSelectedCalendarDay(eventDate);
     }
   }
 
@@ -656,7 +732,7 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
 
   const visibleTabs = account.role === 'member'
     ? tabs
-    : [...tabs, { name: 'Staff' as const, icon: '⚙' }];
+    : [...tabs, { name: 'Staff' as const, icon: '♙' }];
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -674,8 +750,20 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
             <Text numberOfLines={1} style={styles.memberText}>☆ {account.name}</Text>
             <Pressable
               accessibilityRole="button"
+              accessibilityLabel={notificationUnreadCount > 0
+                ? `Notifications, ${notificationUnreadCount} unread`
+                : 'Notifications'}
+              onPress={() => setTab('Notifications')}
+              style={styles.notificationButton}
+            >
+              <Text style={styles.notificationButtonText}>
+                ♧{notificationUnreadCount > 0 ? ` ${notificationUnreadCount}` : ''}
+              </Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
               onPress={() => {
-                void onSignOut().catch(error => {
+                void signOutMember().catch(error => {
                   console.error('Unable to sign out of the local account.', error);
                   setNotice('We could not sign out. Please try again.');
                 });
@@ -692,14 +780,18 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
             {tab === 'Events' ? 'Good things are happening.'
               : tab === 'Bracket' ? 'Let the games begin.'
                 : tab === 'Menu' ? 'Fresh favorites, made for you.'
-                  : tab === 'Rewards' ? 'A little thank you, from us.' : 'Staff workspace.'}
+                  : tab === 'Rewards' ? 'A little thank you, from us.'
+                    : tab === 'Notifications' ? 'A little update for you.'
+                    : tab === 'Settings' ? 'Your settings.' : 'Staff workspace.'}
           </Text>
           <Text style={styles.subtitle}>
             {tab === 'Events' ? 'Pull up a chair. There’s always something to look forward to.'
               : tab === 'Bracket' ? 'Weekly pool tournament brackets, linked to event RSVPs.'
                 : tab === 'Menu' ? 'Simple ingredients. Thoughtful flavors. Find your next favorite.'
                   : tab === 'Rewards' ? 'Every visit brings you closer to something delicious.'
-                    : 'Member support, event operations, and program reporting.'}
+                    : tab === 'Notifications' ? 'RSVPs, event changes, rewards, and announcements in one place.'
+                      : tab === 'Settings' ? 'Manage your account and app preferences.'
+                      : 'Member support, event operations, and program reporting.'}
           </Text>
 
           {notice !== '' && (
@@ -793,9 +885,51 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
           )}
 
           {tab === 'Bracket' && <TournamentBrackets account={account} />}
+          {tab === 'Notifications' && (
+            <NotificationsInbox
+              onNavigate={navigateToNotification}
+              onUnreadCountChange={setNotificationUnreadCount}
+            />
+          )}
 
           {tab === 'Menu' && (
             <>
+              <View style={styles.filters}>
+                {(['All', 'Food', 'Drinks'] as Category[]).map(item => (
+                  <Pressable key={item} accessibilityRole="button" accessibilityState={{ selected: item === category }}
+                    onPress={() => setCategory(item)} style={[styles.filter, item === category && styles.activeFilter]}>
+                    <Text style={[styles.filterText, item === category && styles.activeFilterText]}>{item}</Text>
+                  </Pressable>
+                ))}
+              </View>
+              {menu.filter(item => category === 'All' || item.category === category).map(item => (
+                <View key={item.id} style={styles.menuCard}>
+                  <View style={styles.menuArtwork}><Text style={styles.menuIcon} accessible={false}>{item.icon}</Text></View>
+                  <View style={styles.menuDetails}>
+                    <Text accessibilityRole="header" style={styles.cardTitle}>{item.name}</Text>
+                    <Text style={styles.description}>{item.description}</Text>
+                    <Text style={styles.price}>{item.price}</Text>
+                  </View>
+                </View>
+              ))}
+              <Text style={styles.footnote}>Sample menu · USD prices. Ask our team about allergens before ordering.</Text>
+            </>
+          )}
+
+          {tab === 'Settings' && (
+            <>
+              <View style={styles.card}>
+                <Text accessibilityRole="header" style={styles.sectionTitle}>Account</Text>
+                <View style={styles.settingsRow}>
+                  <Text style={styles.settingsLabel}>Name</Text>
+                  <Text style={styles.settingsValue}>{account.name}</Text>
+                </View>
+                <View style={styles.settingsRow}>
+                  <Text style={styles.settingsLabel}>Email</Text>
+                  <Text style={styles.settingsValue}>{account.email}</Text>
+                </View>
+                <Text style={styles.description}>Profile changes and sign-in method management are not available yet.</Text>
+              </View>
               <View style={styles.card}>
                 <Text accessibilityRole="header" style={styles.sectionTitle}>Appearance</Text>
                 <Text style={styles.description}>Choose how Green Fork looks. The system option follows your device setting.</Text>
@@ -822,25 +956,10 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
                   <Text accessibilityLiveRegion="polite" style={styles.authError}>{preferenceError}</Text>
                 )}
               </View>
-              <View style={styles.filters}>
-                {(['All', 'Food', 'Drinks'] as Category[]).map(item => (
-                  <Pressable key={item} accessibilityRole="button" accessibilityState={{ selected: item === category }}
-                    onPress={() => setCategory(item)} style={[styles.filter, item === category && styles.activeFilter]}>
-                    <Text style={[styles.filterText, item === category && styles.activeFilterText]}>{item}</Text>
-                  </Pressable>
-                ))}
+              <View style={styles.card}>
+                <Text accessibilityRole="header" style={styles.sectionTitle}>Notifications</Text>
+                <NotificationSettings />
               </View>
-              {menu.filter(item => category === 'All' || item.category === category).map(item => (
-                <View key={item.id} style={styles.menuCard}>
-                  <View style={styles.menuArtwork}><Text style={styles.menuIcon} accessible={false}>{item.icon}</Text></View>
-                  <View style={styles.menuDetails}>
-                    <Text accessibilityRole="header" style={styles.cardTitle}>{item.name}</Text>
-                    <Text style={styles.description}>{item.description}</Text>
-                    <Text style={styles.price}>{item.price}</Text>
-                  </View>
-                </View>
-              ))}
-              <Text style={styles.footnote}>Sample menu · USD prices. Ask our team about allergens before ordering.</Text>
             </>
           )}
 
@@ -891,13 +1010,13 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
           <Text style={styles.footnote}>Sample menu.{'\n'}Accounts, events, rewards, points, redemptions, and RSVPs are server-managed.</Text>
         </ScrollView>
 
-        <View accessibilityRole="tablist" style={styles.tabBar}>
+        <View accessibilityRole="tablist" style={[styles.tabBar, visibleTabs.length > 5 && styles.tabBarCompact]}>
           {visibleTabs.map(item => (
             <Pressable key={item.name} accessibilityRole="tab" accessibilityState={{ selected: tab === item.name }}
               onPress={() => { setTab(item.name); setNotice(''); }}
-              style={({ pressed }) => [styles.tab, tab === item.name && styles.activeTab, pressed && styles.pressed]}>
+              style={({ pressed }) => [styles.tab, visibleTabs.length > 5 && styles.tabCompact, tab === item.name && styles.activeTab, pressed && styles.pressed]}>
               <Text accessible={false} style={[styles.tabIcon, tab === item.name && styles.activeTabText]}>{item.icon}</Text>
-              <Text style={[styles.tabText, tab === item.name && styles.activeTabText]}>{item.name}</Text>
+              <Text style={[styles.tabText, visibleTabs.length > 5 && styles.tabTextCompact, tab === item.name && styles.activeTabText]}>{item.name}</Text>
             </Pressable>
           ))}
         </View>
@@ -955,6 +1074,8 @@ function useAppStyles() {
     brandCaption: { color: colors.muted, fontSize: 8, letterSpacing: 1.4, marginTop: 3 },
     memberActions: { alignItems: 'flex-end', gap: 6, flexShrink: 1 },
     memberText: { color: colors.text, fontSize: 12, fontWeight: '600', maxWidth: 120 },
+    notificationButton: { backgroundColor: colors.subtleButton, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 16 },
+    notificationButtonText: { color: colors.subtleButtonText, fontSize: 11, fontWeight: '600' },
     signOutButton: { backgroundColor: colors.subtleButton, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 16 },
     signOutText: { color: colors.subtleButtonText, fontSize: 11, fontWeight: '600' },
     content: { padding: 22, paddingBottom: 30, gap: 16 },
@@ -969,6 +1090,9 @@ function useAppStyles() {
     sectionTitle: { color: colors.text, fontSize: 20, fontWeight: '700' },
     muted: { color: colors.muted, fontSize: 12 },
     card: { backgroundColor: colors.surface, borderRadius: 18, padding: 20, borderWidth: 1, borderColor: colors.border, gap: 12 },
+    settingsRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 16, paddingVertical: 6 },
+    settingsLabel: { color: colors.muted, fontSize: 13 },
+    settingsValue: { color: colors.text, fontSize: 14, fontWeight: '600', flexShrink: 1, textAlign: 'right' },
     eventTop: { flexDirection: 'row', alignItems: 'center', gap: 12 },
     dateBadge: { backgroundColor: colors.surfaceAlt, borderRadius: 12, padding: 10, minWidth: 56, alignItems: 'center' },
     dateMonth: { fontSize: 10, color: colors.brandAccent, fontWeight: '700', letterSpacing: 1 },
@@ -1013,10 +1137,13 @@ function useAppStyles() {
     howItWorks: { padding: 8, gap: 10 },
     footnote: { color: colors.muted, fontSize: 11, textAlign: 'center', lineHeight: 18, marginTop: 8 },
     tabBar: { flexDirection: 'row', padding: 10, gap: 8, backgroundColor: colors.surface, borderTopWidth: 1, borderTopColor: colors.border },
+    tabBarCompact: { paddingHorizontal: 4, gap: 2 },
     tab: { flex: 1, alignItems: 'center', padding: 10, gap: 4, borderRadius: 14 },
+    tabCompact: { paddingHorizontal: 3 },
     activeTab: { backgroundColor: colors.brandSoft },
     tabIcon: { color: colors.muted, fontSize: 24 },
     tabText: { color: colors.muted, fontSize: 12, fontWeight: '600' },
+    tabTextCompact: { fontSize: 10 },
     activeTabText: { color: colors.brandAccent },
     modalBackdrop: { flex: 1, backgroundColor: colors.overlay, alignItems: 'center', justifyContent: 'center', padding: 24 },
     modalCard: { backgroundColor: colors.surface, borderRadius: 20, padding: 24, gap: 16, width: '100%', maxWidth: 400 },

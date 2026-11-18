@@ -3,9 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { createApp } from '../src/app.js';
 import type {
-  Account, AdminReward, AdminUser, BracketGuest, EventAttendee, EventInput, EventRecord, MemberEvent, TournamentBracket,
-  PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, SocialIdentityInput,
-  SocialIdentityProvider, SocialIdentityResult, UserRecord, UserRole,
+  Account, AdminReward, AdminUser, AnnouncementAudience, AppNotification, BracketGuest,
+  EventAttendee, EventInput, EventRecord, ExpoReceipt, MemberEvent, NotificationPage,
+  NotificationPreferences, PushDelivery, PushPlatform, TournamentBracket, PointsLedgerEntry,
+  PointsSummary, RedemptionResult, Reward, SocialIdentityInput, SocialIdentityProvider,
+  SocialIdentityResult, UserRecord, UserRole,
 } from '../src/domain.js';
 import { StoreError } from '../src/domain.js';
 import type { AppConfig } from '../src/config.js';
@@ -43,6 +45,10 @@ class MemoryStore implements Store {
   readonly rsvps = new Map<string, Set<string>>();
   readonly guests = new Map<string, BracketGuest[]>();
   readonly brackets = new Map<string, TournamentBracket>();
+  readonly notifications = new Map<string, AppNotification[]>();
+  readonly notificationPreferences = new Map<string, NotificationPreferences>();
+  readonly pushTokens = new Map<string, { userId: string; platform: PushPlatform }>();
+  readonly announcements = new Map<string, number>();
   readonly audit: Array<{ actorId: string | null; action: string; targetId: string }> = [];
   readonly events: EventRecord[] = [
     {
@@ -217,6 +223,26 @@ class MemoryStore implements Store {
     return [...this.adminRewards.values()].filter(reward => reward.active);
   }
 
+  private addNotification(
+    userId: string,
+    type: AppNotification['type'],
+    title: string,
+    body: string,
+    data: Record<string, string>,
+  ): void {
+    const items = this.notifications.get(userId) ?? [];
+    items.unshift({
+      id: randomUUID(),
+      type,
+      title,
+      body,
+      data,
+      createdAt: new Date().toISOString(),
+      readAt: null,
+    });
+    this.notifications.set(userId, items);
+  }
+
   async redeem(userId: string, rewardId: string, idempotencyKey: string): Promise<RedemptionResult> {
     const key = `${userId}:${idempotencyKey}`;
     const existing = this.redemptions.get(key);
@@ -234,8 +260,108 @@ class MemoryStore implements Store {
     };
     this.balances.set(userId, result.balance);
     this.redemptions.set(key, result);
+    this.addNotification(
+      userId,
+      'reward_redeemed',
+      'Reward redeemed',
+      `${reward.name} was redeemed. Your updated balance is ${result.balance} points.`,
+      { screen: 'Rewards', redemptionId: result.redemptionId },
+    );
     return result;
   }
+
+  async listNotifications(userId: string, limit: number, offset: number): Promise<NotificationPage> {
+    const items = this.notifications.get(userId) ?? [];
+    return {
+      items: items.slice(offset, offset + limit),
+      total: items.length,
+      unreadCount: items.filter(item => item.readAt === null).length,
+    };
+  }
+
+  async markNotificationRead(userId: string, notificationId: string): Promise<boolean> {
+    const item = (this.notifications.get(userId) ?? []).find(notification => notification.id === notificationId);
+    if (!item) return false;
+    item.readAt ??= new Date().toISOString();
+    return true;
+  }
+
+  async markAllNotificationsRead(userId: string): Promise<number> {
+    const items = this.notifications.get(userId) ?? [];
+    let updated = 0;
+    for (const item of items) {
+      if (item.readAt === null) {
+        item.readAt = new Date().toISOString();
+        updated += 1;
+      }
+    }
+    return updated;
+  }
+
+  async getNotificationPreferences(userId: string): Promise<NotificationPreferences> {
+    return this.notificationPreferences.get(userId) ?? {
+      rsvpUpdatesEnabled: true,
+      eventChangesEnabled: true,
+      rewardsEnabled: true,
+      announcementsEnabled: true,
+      pushEnabled: true,
+      reminderSchedule: '24h',
+    };
+  }
+
+  async updateNotificationPreferences(
+    userId: string,
+    preferences: NotificationPreferences,
+  ): Promise<NotificationPreferences> {
+    this.notificationPreferences.set(userId, preferences);
+    return preferences;
+  }
+
+  async registerPushToken(userId: string, token: string, platform: PushPlatform): Promise<void> {
+    this.pushTokens.set(token, { userId, platform });
+  }
+
+  async revokePushToken(userId: string, token: string): Promise<void> {
+    if (this.pushTokens.get(token)?.userId === userId) this.pushTokens.delete(token);
+  }
+
+  async createAnnouncement(
+    _actorId: string,
+    title: string,
+    body: string,
+    audience: AnnouncementAudience,
+    idempotencyKey: string,
+  ): Promise<{ recipients: number; alreadyApplied: boolean }> {
+    const previous = this.announcements.get(idempotencyKey);
+    if (previous !== undefined) return { recipients: previous, alreadyApplied: true };
+    let recipientIds: string[];
+    if (audience.type === 'all') {
+      recipientIds = [...this.users.values()].filter(user => user.role === 'member').map(user => user.id);
+    } else {
+      if (!this.events.some(event => event.id === audience.eventId && event.active)) {
+        throw new StoreError('event_not_found', 'Event not found.');
+      }
+      recipientIds = [...(this.rsvps.get(`${audience.eventId}:${audience.occurrenceStart}`) ?? [])];
+    }
+    for (const userId of recipientIds) {
+      this.addNotification(userId, 'announcement', title, body,
+        audience.type === 'event'
+          ? { screen: 'Events', eventId: audience.eventId, occurrenceStart: audience.occurrenceStart }
+          : { screen: 'Events' });
+    }
+    this.announcements.set(idempotencyKey, recipientIds.length);
+    return { recipients: recipientIds.length, alreadyApplied: false };
+  }
+
+  async enqueueDueEventReminders(): Promise<void> {}
+  async claimPushDeliveries(_limit: number): Promise<PushDelivery[]> { return []; }
+  async markPushDeliverySubmitted(_deliveryId: string, _ticketId: string): Promise<void> {}
+  async retryPushDelivery(_deliveryId: string, _error: string, _delaySeconds: number): Promise<void> {}
+  async failPushDelivery(_deliveryId: string, _error: string, _deactivateToken: boolean): Promise<void> {}
+  async listDueExpoReceipts(_limit: number): Promise<ExpoReceipt[]> { return []; }
+  async markExpoReceiptDelivered(_deliveryId: string): Promise<void> {}
+  async markExpoReceiptFailed(_deliveryId: string, _error: string, _deactivateToken: boolean): Promise<void> {}
+  async cleanupNotifications(): Promise<void> {}
 
   async listEvents(userId: string): Promise<MemberEvent[]> {
     return this.events.filter(event => event.active).map(event => ({
@@ -276,6 +402,9 @@ class MemoryStore implements Store {
     }
     attendees.add(userId);
     this.rsvps.set(key, attendees);
+    this.addNotification(userId, 'rsvp_confirmed', 'RSVP confirmed',
+      `You're on the guest list for ${event.title}.`,
+      { screen: 'Events', eventId, occurrenceStart });
     return 'rsvped';
   }
 
@@ -285,7 +414,13 @@ class MemoryStore implements Store {
       throw new StoreError('rsvp_closed', 'RSVPs are closed for this event occurrence.');
     }
     const attendees = this.rsvps.get(`${eventId}:${occurrenceStart}`);
-    return attendees?.delete(userId) ?? false;
+    const cancelled = attendees?.delete(userId) ?? false;
+    if (cancelled && event) {
+      this.addNotification(userId, 'rsvp_cancelled', 'RSVP canceled',
+        `Your RSVP for ${event.title} was canceled.`,
+        { screen: 'Events', eventId, occurrenceStart });
+    }
+    return cancelled;
   }
 
   async getEventBracket(eventId: string, occurrenceStart: string): Promise<TournamentBracket> {
@@ -566,6 +701,7 @@ const config: AppConfig = {
   sessionCookieName: 'gf_refresh',
   googleClientIds: ['green-fork-google-client-id'],
   appleBundleId: 'com.greenfork.rewards',
+  expoAccessToken: '',
 };
 
 const store = new MemoryStore();
@@ -588,6 +724,23 @@ const socialTokenVerifier: SocialTokenVerifier = {
   },
 };
 const app = createApp({ config, store, emailSender, socialTokenVerifier });
+
+async function createAuthenticatedUser(name: string, email: string, role: UserRole = 'member') {
+  const user = await store.createUser(randomUUID(), name, email, 'test-password-hash');
+  if (!user) throw new Error('Test user could not be created.');
+  user.role = role;
+  const accessToken = `test-access-${randomUUID()}`;
+  const refreshToken = `test-refresh-${randomUUID()}`;
+  await store.createSession(
+    randomUUID(),
+    user.id,
+    hashOpaqueToken(accessToken),
+    hashOpaqueToken(refreshToken),
+    new Date(Date.now() + 15 * 60_000),
+    new Date(Date.now() + 24 * 60 * 60_000),
+  );
+  return { user, headers: { authorization: `Bearer ${accessToken}` } };
+}
 
 before(async () => {
   await app.ready();
@@ -1128,4 +1281,157 @@ test('staff and admin routes enforce roles, return limited data, and audit privi
   assert.ok(store.audit.some(entry => entry.action === 'event.update'));
   assert.ok(store.audit.some(entry => entry.action === 'event.archive'));
   assert.ok(store.audit.some(entry => entry.action === 'reward.archive'));
+});
+
+test('notification APIs keep feeds and preferences scoped to the signed-in user', async () => {
+  const member = await createAuthenticatedUser('Notification Member', 'notification-member@example.com');
+  const other = await createAuthenticatedUser('Other Member', 'notification-other@example.com');
+  assert.equal((await app.inject({ method: 'GET', url: '/api/notifications' })).statusCode, 401);
+
+  const defaults = await app.inject({
+    method: 'GET',
+    url: '/api/notifications/preferences',
+    headers: member.headers,
+  });
+  assert.equal(defaults.statusCode, 200);
+  assert.deepEqual(defaults.json<{ preferences: NotificationPreferences }>().preferences, {
+    rsvpUpdatesEnabled: true,
+    eventChangesEnabled: true,
+    rewardsEnabled: true,
+    announcementsEnabled: true,
+    pushEnabled: true,
+    reminderSchedule: '24h',
+  });
+
+  const invalidPreferences = await app.inject({
+    method: 'POST',
+    url: '/api/notifications/preferences',
+    headers: member.headers,
+    payload: { pushEnabled: false },
+  });
+  assert.equal(invalidPreferences.statusCode, 400);
+
+  const eventId = 'notifications-event';
+  const occurrenceStart = new Date(Date.now() + 60 * 60_000).toISOString();
+  store.events.push({
+    ...store.events[0],
+    id: eventId,
+    title: 'Notification event',
+    startsAt: occurrenceStart,
+    bracketEnabled: false,
+  });
+  const rsvp = await app.inject({
+    method: 'POST',
+    url: `/api/events/${eventId}/rsvp`,
+    headers: member.headers,
+    payload: { occurrenceStart },
+  });
+  assert.equal(rsvp.statusCode, 201);
+
+  const feed = await app.inject({
+    method: 'GET',
+    url: '/api/notifications?page=1&pageSize=10',
+    headers: member.headers,
+  });
+  assert.equal(feed.statusCode, 200);
+  const notification = feed.json<{ items: AppNotification[]; unreadCount: number }>().items[0];
+  assert.equal(notification.type, 'rsvp_confirmed');
+  assert.equal(feed.json<{ unreadCount: number }>().unreadCount, 1);
+  assert.equal(JSON.stringify(feed.json()).includes('notification-other@example.com'), false);
+
+  const unauthorizedRead = await app.inject({
+    method: 'POST',
+    url: `/api/notifications/${notification.id}/read`,
+    headers: other.headers,
+    payload: {},
+  });
+  assert.equal(unauthorizedRead.statusCode, 404);
+  const read = await app.inject({
+    method: 'POST',
+    url: `/api/notifications/${notification.id}/read`,
+    headers: member.headers,
+    payload: {},
+  });
+  assert.equal(read.statusCode, 200);
+  assert.equal((await app.inject({
+    method: 'GET',
+    url: '/api/notifications',
+    headers: member.headers,
+  })).json<{ unreadCount: number }>().unreadCount, 0);
+
+  const saved = await app.inject({
+    method: 'POST',
+    url: '/api/notifications/preferences',
+    headers: member.headers,
+    payload: {
+      rsvpUpdatesEnabled: false,
+      eventChangesEnabled: true,
+      rewardsEnabled: true,
+      announcementsEnabled: false,
+      pushEnabled: false,
+      reminderSchedule: 'off',
+    },
+  });
+  assert.equal(saved.statusCode, 200);
+  assert.equal(saved.json<{ preferences: NotificationPreferences }>().preferences.pushEnabled, false);
+
+  const token = 'ExponentPushToken[abc123ABC_1234567890]';
+  assert.equal((await app.inject({
+    method: 'POST',
+    url: '/api/notifications/push-token',
+    headers: member.headers,
+    payload: { token, platform: 'ios' },
+  })).statusCode, 200);
+  assert.equal((await app.inject({
+    method: 'POST',
+    url: '/api/notifications/push-token',
+    headers: member.headers,
+    payload: { token: 'not-an-expo-token', platform: 'ios' },
+  })).statusCode, 400);
+  assert.equal((await app.inject({
+    method: 'DELETE',
+    url: '/api/notifications/push-token',
+    headers: member.headers,
+    payload: { token },
+  })).statusCode, 200);
+});
+
+test('only staff can publish idempotent event-targeted announcements', async () => {
+  const member = await createAuthenticatedUser('Announcement Recipient', 'announcement-recipient@example.com');
+  const staff = await createAuthenticatedUser('Announcement Staff', 'announcement-staff@example.com', 'staff');
+  const eventId = 'announcement-event';
+  const occurrenceStart = new Date(Date.now() + 2 * 60 * 60_000).toISOString();
+  store.events.push({
+    ...store.events[0],
+    id: eventId,
+    title: 'Announcement event',
+    startsAt: occurrenceStart,
+    bracketEnabled: false,
+  });
+  assert.equal(await store.rsvpToEvent(member.user.id, eventId, occurrenceStart), 'rsvped');
+
+  const request = {
+    method: 'POST' as const,
+    url: '/api/admin/announcements',
+    headers: { ...staff.headers, 'idempotency-key': 'announcement-event-0001' },
+    payload: {
+      title: 'Schedule update',
+      body: 'The event starts at the posted time.',
+      audience: { type: 'event', eventId, occurrenceStart },
+    },
+  };
+  assert.equal((await app.inject({ ...request, headers: member.headers })).statusCode, 403);
+  const published = await app.inject(request);
+  assert.equal(published.statusCode, 201);
+  assert.deepEqual(published.json(), { recipients: 1, alreadyApplied: false });
+  const repeated = await app.inject(request);
+  assert.equal(repeated.statusCode, 200);
+  assert.deepEqual(repeated.json(), { recipients: 1, alreadyApplied: true });
+
+  const feed = await app.inject({
+    method: 'GET',
+    url: '/api/notifications',
+    headers: member.headers,
+  });
+  assert.ok(feed.json<{ items: AppNotification[] }>().items.some(item => item.type === 'announcement'));
 });

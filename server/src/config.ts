@@ -15,6 +15,7 @@ export type AppConfig = {
   sessionCookieName: string;
   googleClientIds: string[];
   appleBundleId: string;
+  expoAccessToken: string;
 };
 
 function required(value: string | undefined, name: string): string {
@@ -61,5 +62,6 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       .map((clientId: string) => clientId.trim())
       .filter(Boolean),
     appleBundleId: env.APPLE_BUNDLE_ID?.trim() ?? '',
+    expoAccessToken: env.EXPO_ACCESS_TOKEN?.trim() ?? '',
   };
 }

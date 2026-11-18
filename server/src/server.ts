@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { createApp } from './app.js';
 import { readConfig } from './config.js';
 import { createEmailSender } from './email.js';
+import { runNotificationDeliveryCycle } from './notificationDelivery.js';
 import { PostgresStore } from './postgresStore.js';
 
 const config = readConfig();
@@ -28,12 +29,38 @@ const finalizeDueBrackets = async () => {
 const bracketSweep = setInterval(() => void finalizeDueBrackets(), 30_000);
 bracketSweep.unref();
 
+let notificationSweepRunning = false;
+let lastNotificationCleanup = 0;
+const notificationSweep = setInterval(() => {
+  if (notificationSweepRunning) return;
+  notificationSweepRunning = true;
+  void (async () => {
+    try {
+      await store.enqueueDueEventReminders();
+      await runNotificationDeliveryCycle(store, config.expoAccessToken);
+      if (Date.now() - lastNotificationCleanup >= 60 * 60 * 1000) {
+        await store.cleanupNotifications();
+        lastNotificationCleanup = Date.now();
+      }
+    } catch (error) {
+      app.log.error({ err: error }, 'Unable to process notification work.');
+    } finally {
+      notificationSweepRunning = false;
+    }
+  })();
+}, 30_000);
+notificationSweep.unref();
+
 try {
   await app.listen({ host: '0.0.0.0', port: config.port });
   void finalizeDueBrackets();
+  void store.enqueueDueEventReminders()
+    .then(() => runNotificationDeliveryCycle(store, config.expoAccessToken))
+    .catch(error => app.log.error({ err: error }, 'Unable to process notification work at startup.'));
 } catch (error) {
   app.log.error(error);
   clearInterval(bracketSweep);
+  clearInterval(notificationSweep);
   await pool.end();
   process.exitCode = 1;
 }
@@ -41,6 +68,7 @@ try {
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
     clearInterval(bracketSweep);
+    clearInterval(notificationSweep);
     void app.close().then(() => pool.end());
   });
 }

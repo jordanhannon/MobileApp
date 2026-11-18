@@ -78,6 +78,29 @@ an EAS development build; local iOS builds require macOS.
    signatures, issuer, audience, expiry, and one-time nonce before creating or
    linking a member account; provider tokens are not stored.
 
+## Notifications
+
+- Members have a persisted in-app inbox, unread/read state, category controls,
+  push-delivery preferences, and configurable RSVP reminders. Categories are on
+  by default; reminders default to 24 hours before an event. Options are Off,
+  24 hours, 1 hour, or 24 hours plus 1 hour.
+- General event, RSVP, reward, and announcement notifications use the inbox and
+  Expo push only; verification and password-reset emails remain separate.
+  Push permission is requested after an RSVP or from Settings. The inbox works
+  on web, but remote push registration is limited to iOS and Android.
+- For native push, configure an EAS project ID and its APNs/FCM credentials,
+  then build and test with a development or release build. Expo Go/web should
+  not be used to validate production push delivery. The client obtains an Expo
+  push token and registers it with the authenticated API. Optionally set
+  `EXPO_ACCESS_TOKEN` in `server/.env` to authenticate requests to Expo; keep
+  this server-only secret out of the app.
+- The server stores feed entries and push work in PostgreSQL. A database-backed
+  worker processes RSVP reminders, retries failed push submissions, checks
+  Expo receipts, and deactivates invalid tokens. Feed entries expire after 90
+  days. Staff and admins can publish announcements to all members or attendees
+  of a selected event occurrence from Staff → Announcements.
+- Apply the new database migration with `npm run migrate --prefix server`.
+
 ## Validate
 
 ```sh
@@ -96,8 +119,11 @@ migration first with `npm run migrate --prefix server`.
 ## Architecture and production notes
 
 - Appearance follows the device setting by default. Users can choose System,
-  Light, or Dark in the Menu tab; manual choices persist on the device. The
+  Light, or Dark in the Settings tab; manual choices persist on the device. The
   shared brand green is `#07702D`, sampled from the provided reference.
+- Settings displays the signed-in account name and email, notification
+  preferences, and the System/Light/Dark appearance control. Profile editing
+  and sign-in method management are not available yet.
 - The app sends registration, email/password and social sign-in, email
   verification, password reset, session, reward-list, and redemption requests
   to the API.

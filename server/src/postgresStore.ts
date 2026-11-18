@@ -1,9 +1,11 @@
 import { randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Pool, PoolClient, QueryResultRow } from 'pg';
 import type {
-  Account, AdminReward, AdminUser, BracketGuest, BracketMatch, EventAttendee, EventInput, EventRecord, MemberEvent,
-  PointsLedgerEntry, PointsSummary, RedemptionResult, Reward, SocialIdentityInput,
-  SocialIdentityResult, TournamentBracket, UserRecord, UserRole,
+  Account, AdminReward, AdminUser, AnnouncementAudience, AppNotification, BracketGuest, BracketMatch,
+  EventAttendee, EventInput, EventRecord, ExpoReceipt, MemberEvent, NotificationPage,
+  NotificationPreferences, NotificationType, PushDelivery, PushPlatform, PointsLedgerEntry,
+  PointsSummary, RedemptionResult, Reward, SocialIdentityInput, SocialIdentityResult,
+  TournamentBracket, UserRecord, UserRole,
 } from './domain.js';
 import { StoreError } from './domain.js';
 import type { EmailTokenPurpose, Store } from './store.js';
@@ -66,6 +68,37 @@ type LedgerRow = QueryResultRow & {
   entry_type: string;
   reference_id: string | null;
   created_at: Date;
+};
+
+type NotificationRow = QueryResultRow & {
+  id: string;
+  notification_type: NotificationType;
+  title: string;
+  body: string;
+  data: Record<string, unknown>;
+  created_at: Date;
+  read_at: Date | null;
+};
+
+type PreferenceRow = QueryResultRow & {
+  rsvp_updates_enabled: boolean;
+  event_changes_enabled: boolean;
+  rewards_enabled: boolean;
+  announcements_enabled: boolean;
+  push_enabled: boolean;
+  reminder_schedule: NotificationPreferences['reminderSchedule'];
+};
+
+type NotificationCategory = 'rsvp' | 'event' | 'rewards' | 'announcements';
+
+type NewNotification = {
+  userId: string;
+  category: NotificationCategory;
+  type: NotificationType;
+  title: string;
+  body: string;
+  data: Record<string, string>;
+  dedupeKey: string;
 };
 
 type BracketMatchDraft = {
@@ -222,6 +255,29 @@ function toPointsLedgerEntry(row: LedgerRow): PointsLedgerEntry {
   };
 }
 
+function toNotification(row: NotificationRow): AppNotification {
+  return {
+    id: row.id,
+    type: row.notification_type,
+    title: row.title,
+    body: row.body,
+    data: Object.fromEntries(Object.entries(row.data ?? {}).map(([key, value]) => [key, String(value)])),
+    createdAt: row.created_at.toISOString(),
+    readAt: row.read_at?.toISOString() ?? null,
+  };
+}
+
+function toNotificationPreferences(row?: PreferenceRow): NotificationPreferences {
+  return {
+    rsvpUpdatesEnabled: row?.rsvp_updates_enabled ?? true,
+    eventChangesEnabled: row?.event_changes_enabled ?? true,
+    rewardsEnabled: row?.rewards_enabled ?? true,
+    announcementsEnabled: row?.announcements_enabled ?? true,
+    pushEnabled: row?.push_enabled ?? true,
+    reminderSchedule: row?.reminder_schedule ?? '24h',
+  };
+}
+
 function isUniqueViolation(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === '23505';
 }
@@ -243,6 +299,49 @@ async function accountByUserId(client: Pool | PoolClient, userId: string): Promi
 
 export class PostgresStore implements Store {
   constructor(private readonly pool: Pool) {}
+
+  private async createNotification(client: PoolClient, input: NewNotification): Promise<string | null> {
+    const preferenceResult = await client.query<PreferenceRow>(
+      `SELECT COALESCE(rsvp_updates_enabled, TRUE) AS rsvp_updates_enabled,
+              COALESCE(event_changes_enabled, TRUE) AS event_changes_enabled,
+              COALESCE(rewards_enabled, TRUE) AS rewards_enabled,
+              COALESCE(announcements_enabled, TRUE) AS announcements_enabled,
+              COALESCE(push_enabled, TRUE) AS push_enabled,
+              COALESCE(reminder_schedule, '24h') AS reminder_schedule
+       FROM notification_preferences WHERE user_id = $1`,
+      [input.userId],
+    );
+    const preferences = toNotificationPreferences(preferenceResult.rows[0]);
+    const categoryEnabled = input.category === 'rsvp'
+      ? preferences.rsvpUpdatesEnabled
+      : input.category === 'event'
+        ? preferences.eventChangesEnabled
+        : input.category === 'rewards'
+          ? preferences.rewardsEnabled
+          : preferences.announcementsEnabled;
+    if (!categoryEnabled) return null;
+
+    const inserted = await client.query<QueryResultRow & { id: string }>(
+      `INSERT INTO notifications (id, user_id, notification_type, title, body, data, dedupe_key)
+       VALUES ($1, $2, $3, $4, $5, $6::JSONB, $7)
+       ON CONFLICT (user_id, dedupe_key) DO NOTHING
+       RETURNING id`,
+      [randomUUID(), input.userId, input.type, input.title, input.body, JSON.stringify(input.data), input.dedupeKey],
+    );
+    const notificationId = inserted.rows[0]?.id;
+    if (!notificationId) return null;
+
+    if (preferences.pushEnabled) {
+      await client.query(
+        `INSERT INTO notification_push_outbox (id, notification_id, push_token_id)
+         SELECT gen_random_uuid(), $1, id FROM notification_push_tokens
+         WHERE user_id = $2 AND revoked_at IS NULL
+         ON CONFLICT (notification_id, push_token_id) DO NOTHING`,
+        [notificationId, input.userId],
+      );
+    }
+    return notificationId;
+  }
 
   async createUser(id: string, name: string, email: string, passwordHash: string): Promise<UserRecord | null> {
     try {
@@ -642,6 +741,15 @@ export class PostgresStore implements Store {
          VALUES ($1, $2, $3, 'redemption', $4)`,
         [randomUUID(), userId, -rewardRow.points_cost, redemptionId],
       );
+      await this.createNotification(client, {
+        userId,
+        category: 'rewards',
+        type: 'reward_redeemed',
+        title: 'Reward redeemed',
+        body: `${rewardRow.name} was redeemed. Your updated balance is ${balanceAfter} points.`,
+        data: { screen: 'Rewards', redemptionId },
+        dedupeKey: `reward-redemption:${redemptionId}`,
+      });
       await client.query('COMMIT');
       return {
         kind: 'redeemed',
@@ -656,6 +764,476 @@ export class PostgresStore implements Store {
     } finally {
       client.release();
     }
+  }
+
+  async listNotifications(userId: string, limit: number, offset: number): Promise<NotificationPage> {
+    const [feed, counts] = await Promise.all([
+      this.pool.query<NotificationRow>(
+        `SELECT id, notification_type, title, body, data, created_at, read_at
+         FROM notifications
+         WHERE user_id = $1 AND expires_at > NOW()
+         ORDER BY created_at DESC, id DESC
+         LIMIT $2 OFFSET $3`,
+        [userId, limit, offset],
+      ),
+      this.pool.query<QueryResultRow & { total: string; unread_count: string }>(
+        `SELECT COUNT(*)::TEXT AS total,
+                COUNT(*) FILTER (WHERE read_at IS NULL)::TEXT AS unread_count
+         FROM notifications WHERE user_id = $1 AND expires_at > NOW()`,
+        [userId],
+      ),
+    ]);
+    return {
+      items: feed.rows.map(toNotification),
+      total: Number(counts.rows[0].total),
+      unreadCount: Number(counts.rows[0].unread_count),
+    };
+  }
+
+  async markNotificationRead(userId: string, notificationId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE notifications SET read_at = COALESCE(read_at, NOW())
+       WHERE id = $1 AND user_id = $2 AND expires_at > NOW()`,
+      [notificationId, userId],
+    );
+    return Boolean(result.rowCount);
+  }
+
+  async markAllNotificationsRead(userId: string): Promise<number> {
+    const result = await this.pool.query(
+      `UPDATE notifications SET read_at = NOW()
+       WHERE user_id = $1 AND read_at IS NULL AND expires_at > NOW()`,
+      [userId],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  async getNotificationPreferences(userId: string): Promise<NotificationPreferences> {
+    const result = await this.pool.query<PreferenceRow>(
+      `SELECT rsvp_updates_enabled, event_changes_enabled, rewards_enabled,
+              announcements_enabled, push_enabled, reminder_schedule
+       FROM notification_preferences WHERE user_id = $1`,
+      [userId],
+    );
+    return toNotificationPreferences(result.rows[0]);
+  }
+
+  async updateNotificationPreferences(
+    userId: string,
+    preferences: NotificationPreferences,
+  ): Promise<NotificationPreferences> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<PreferenceRow>(
+        `INSERT INTO notification_preferences (
+           user_id, rsvp_updates_enabled, event_changes_enabled, rewards_enabled,
+           announcements_enabled, push_enabled, reminder_schedule, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+         ON CONFLICT (user_id) DO UPDATE SET
+           rsvp_updates_enabled = EXCLUDED.rsvp_updates_enabled,
+           event_changes_enabled = EXCLUDED.event_changes_enabled,
+           rewards_enabled = EXCLUDED.rewards_enabled,
+           announcements_enabled = EXCLUDED.announcements_enabled,
+           push_enabled = EXCLUDED.push_enabled,
+           reminder_schedule = EXCLUDED.reminder_schedule,
+           updated_at = NOW()
+         RETURNING rsvp_updates_enabled, event_changes_enabled, rewards_enabled,
+                   announcements_enabled, push_enabled, reminder_schedule`,
+        [
+          userId, preferences.rsvpUpdatesEnabled, preferences.eventChangesEnabled,
+          preferences.rewardsEnabled, preferences.announcementsEnabled,
+          preferences.pushEnabled, preferences.reminderSchedule,
+        ],
+      );
+      await client.query(
+        `UPDATE notification_push_outbox o
+         SET status = 'failed', last_error = 'Disabled by recipient preferences',
+             locked_until = NULL, updated_at = NOW()
+         FROM notifications n
+         WHERE n.id = o.notification_id AND n.user_id = $1 AND o.status = 'pending'
+           AND (
+             NOT $2
+             OR (n.notification_type IN ('rsvp_confirmed', 'rsvp_cancelled', 'event_reminder') AND NOT $3)
+             OR (n.notification_type IN ('event_changed', 'event_cancelled') AND NOT $4)
+             OR (n.notification_type IN ('points_earned', 'reward_redeemed') AND NOT $5)
+             OR (n.notification_type = 'announcement' AND NOT $6)
+           )`,
+        [
+          userId, preferences.pushEnabled, preferences.rsvpUpdatesEnabled,
+          preferences.eventChangesEnabled, preferences.rewardsEnabled,
+          preferences.announcementsEnabled,
+        ],
+      );
+      await client.query('COMMIT');
+      return toNotificationPreferences(result.rows[0]);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async registerPushToken(userId: string, token: string, platform: PushPlatform): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE notification_push_outbox
+         SET status = 'failed', last_error = 'Push token was reassigned',
+             locked_until = NULL, updated_at = NOW()
+         WHERE push_token_id = (
+           SELECT id FROM notification_push_tokens WHERE expo_push_token = $1
+         ) AND status = 'pending'`,
+        [token],
+      );
+      await client.query(
+        `INSERT INTO notification_push_tokens (id, user_id, expo_push_token, platform)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (expo_push_token) DO UPDATE SET
+           user_id = EXCLUDED.user_id,
+           platform = EXCLUDED.platform,
+           last_seen_at = NOW(),
+           revoked_at = NULL`,
+        [randomUUID(), userId, token, platform],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async revokePushToken(userId: string, token: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE notification_push_tokens SET revoked_at = COALESCE(revoked_at, NOW())
+         WHERE user_id = $1 AND expo_push_token = $2`,
+        [userId, token],
+      );
+      await client.query(
+        `UPDATE notification_push_outbox SET status = 'failed',
+         last_error = 'Push token was revoked', locked_until = NULL, updated_at = NOW()
+         WHERE status = 'pending' AND push_token_id = (
+           SELECT id FROM notification_push_tokens WHERE user_id = $1 AND expo_push_token = $2
+         )`,
+        [userId, token],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async createAnnouncement(
+    actorId: string,
+    title: string,
+    body: string,
+    audience: AnnouncementAudience,
+    idempotencyKey: string,
+  ): Promise<{ recipients: number; alreadyApplied: boolean }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const scopedIdempotencyKey = `${actorId}:${idempotencyKey}`;
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`announcement:${scopedIdempotencyKey}`]);
+      const existing = await client.query<QueryResultRow & { id: string }>(
+        'SELECT id FROM staff_announcements WHERE idempotency_key = $1',
+        [scopedIdempotencyKey],
+      );
+      if (existing.rows[0]) {
+        const count = await client.query<QueryResultRow & { total: string }>(
+          `SELECT COUNT(*)::TEXT AS total FROM notifications
+           WHERE dedupe_key = $1`,
+          [`announcement:${existing.rows[0].id}`],
+        );
+        await client.query('COMMIT');
+        return { recipients: Number(count.rows[0].total), alreadyApplied: true };
+      }
+
+      const announcementId = randomUUID();
+      let recipientIds: string[];
+      if (audience.type === 'all') {
+        const recipients = await client.query<QueryResultRow & { id: string }>(
+          `SELECT id FROM users WHERE role = 'member' ORDER BY id`,
+        );
+        recipientIds = recipients.rows.map(row => row.id);
+      } else {
+        const event = await client.query<QueryResultRow & { active: boolean }>(
+          'SELECT active FROM events WHERE id = $1',
+          [audience.eventId],
+        );
+        if (!event.rows[0]?.active) throw new StoreError('event_not_found', 'Event not found.');
+        const recipients = await client.query<QueryResultRow & { user_id: string }>(
+          `SELECT DISTINCT user_id FROM event_rsvps
+           WHERE event_id = $1 AND occurrence_start = $2`,
+          [audience.eventId, audience.occurrenceStart],
+        );
+        recipientIds = recipients.rows.map(row => row.user_id);
+      }
+
+      await client.query(
+        `INSERT INTO staff_announcements (id, actor_id, idempotency_key, title, body, audience)
+         VALUES ($1, $2, $3, $4, $5, $6::JSONB)`,
+        [announcementId, actorId, scopedIdempotencyKey, title, body, JSON.stringify(audience)],
+      );
+      let created = 0;
+      for (const userId of recipientIds) {
+        const notificationId = await this.createNotification(client, {
+          userId,
+          category: 'announcements',
+          type: 'announcement',
+          title,
+          body,
+          data: audience.type === 'event'
+            ? { screen: 'Events', eventId: audience.eventId, occurrenceStart: audience.occurrenceStart }
+            : { screen: 'Events' },
+          dedupeKey: `announcement:${announcementId}`,
+        });
+        if (notificationId) created += 1;
+      }
+      await this.writeAudit(client, actorId, 'announcement.publish', 'announcement', announcementId, {
+        title,
+        audience,
+        recipientCount: created,
+      });
+      await client.query('COMMIT');
+      return { recipients: created, alreadyApplied: false };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async enqueueDueEventReminders(): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const due = await client.query<QueryResultRow & {
+        user_id: string;
+        event_id: string;
+        occurrence_start: Date;
+        title: string;
+        reminder_offset: '24h' | '1h';
+      }>(
+        `SELECT r.user_id, r.event_id, r.occurrence_start, e.title, reminder.offset_code AS reminder_offset
+         FROM event_rsvps r
+         JOIN events e ON e.id = r.event_id AND e.active = TRUE
+         LEFT JOIN notification_preferences p ON p.user_id = r.user_id
+         CROSS JOIN (VALUES ('24h'::TEXT, INTERVAL '24 hours'), ('1h'::TEXT, INTERVAL '1 hour'))
+           AS reminder(offset_code, duration)
+         WHERE r.occurrence_start > NOW()
+           AND r.occurrence_start <= NOW() + reminder.duration
+           AND (
+             COALESCE(p.reminder_schedule, '24h') = '24h_1h'
+             OR (reminder.offset_code = '24h' AND COALESCE(p.reminder_schedule, '24h') = '24h')
+             OR (reminder.offset_code = '1h' AND COALESCE(p.reminder_schedule, '24h') = '1h')
+           )
+         ORDER BY r.occurrence_start, r.user_id`,
+      );
+      for (const item of due.rows) {
+        const occurrenceStart = item.occurrence_start.toISOString();
+        await this.createNotification(client, {
+          userId: item.user_id,
+          category: 'rsvp',
+          type: 'event_reminder',
+          title: 'Event reminder',
+          body: `Reminder: You RSVP'd to ${item.title}.`,
+          data: { screen: 'Events', eventId: item.event_id, occurrenceStart },
+          dedupeKey: `event-reminder:${item.event_id}:${occurrenceStart}:${item.reminder_offset}`,
+        });
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async claimPushDeliveries(limit: number): Promise<PushDelivery[]> {
+    const result = await this.pool.query<QueryResultRow & {
+      id: string;
+      notification_id: string;
+      expo_push_token: string;
+      title: string;
+      body: string;
+      data: Record<string, unknown>;
+      attempt_count: number;
+    }>(
+      `WITH candidates AS (
+         SELECT o.id
+         FROM notification_push_outbox o
+         JOIN notifications n ON n.id = o.notification_id AND n.expires_at > NOW()
+         JOIN notification_push_tokens t ON t.id = o.push_token_id AND t.revoked_at IS NULL
+         LEFT JOIN notification_preferences p ON p.user_id = n.user_id
+         WHERE (
+             (o.status = 'pending' AND o.next_attempt_at <= NOW())
+             OR (o.status = 'processing' AND o.locked_until <= NOW())
+           )
+           AND COALESCE(p.push_enabled, TRUE)
+           AND (
+             (n.notification_type IN ('rsvp_confirmed', 'rsvp_cancelled', 'event_reminder') AND COALESCE(p.rsvp_updates_enabled, TRUE))
+             OR (n.notification_type IN ('event_changed', 'event_cancelled') AND COALESCE(p.event_changes_enabled, TRUE))
+             OR (n.notification_type IN ('points_earned', 'reward_redeemed') AND COALESCE(p.rewards_enabled, TRUE))
+             OR (n.notification_type = 'announcement' AND COALESCE(p.announcements_enabled, TRUE))
+           )
+         ORDER BY o.next_attempt_at, o.created_at
+         FOR UPDATE OF o SKIP LOCKED
+         LIMIT $1
+       ), claimed AS (
+         UPDATE notification_push_outbox o
+         SET status = 'processing', attempt_count = attempt_count + 1,
+             locked_until = NOW() + INTERVAL '5 minutes', updated_at = NOW()
+         FROM candidates c
+         WHERE o.id = c.id
+         RETURNING o.id, o.notification_id, o.push_token_id, o.attempt_count
+       )
+       SELECT c.id, c.notification_id, t.expo_push_token, n.title, n.body, n.data, c.attempt_count
+       FROM claimed c
+       JOIN notification_push_tokens t ON t.id = c.push_token_id
+       JOIN notifications n ON n.id = c.notification_id`,
+      [Math.min(Math.max(limit, 1), 100)],
+    );
+    return result.rows.map(row => ({
+      id: row.id,
+      notificationId: row.notification_id,
+      token: row.expo_push_token,
+      title: row.title,
+      body: row.body,
+      data: Object.fromEntries(Object.entries(row.data ?? {}).map(([key, value]) => [key, String(value)])),
+      attemptCount: row.attempt_count,
+    }));
+  }
+
+  async markPushDeliverySubmitted(deliveryId: string, ticketId: string): Promise<void> {
+    const result = await this.pool.query(
+      `UPDATE notification_push_outbox
+       SET status = 'submitted', expo_ticket_id = $2,
+           receipt_check_at = NOW() + INTERVAL '15 minutes',
+           locked_until = NULL, last_error = NULL, updated_at = NOW()
+       WHERE id = $1 AND status = 'processing'`,
+      [deliveryId, ticketId],
+    );
+    if (!result.rowCount) throw new Error('Push delivery was no longer claimed.');
+  }
+
+  async retryPushDelivery(deliveryId: string, error: string, delaySeconds: number): Promise<void> {
+    await this.pool.query(
+      `UPDATE notification_push_outbox
+       SET status = CASE WHEN attempt_count >= 5 THEN 'failed' ELSE 'pending' END,
+           next_attempt_at = NOW() + ($3::TEXT || ' seconds')::INTERVAL,
+           locked_until = NULL, last_error = $2, updated_at = NOW()
+       WHERE id = $1 AND status = 'processing'`,
+      [deliveryId, error.slice(0, 500), Math.max(1, Math.min(delaySeconds, 3600))],
+    );
+  }
+
+  async failPushDelivery(deliveryId: string, error: string, deactivateToken: boolean): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      if (deactivateToken) {
+        await client.query(
+          `UPDATE notification_push_tokens SET revoked_at = COALESCE(revoked_at, NOW())
+           WHERE id = (SELECT push_token_id FROM notification_push_outbox WHERE id = $1)`,
+          [deliveryId],
+        );
+      }
+      await client.query(
+        `UPDATE notification_push_outbox
+         SET status = 'failed', locked_until = NULL, receipt_check_at = NULL,
+             last_error = $2, updated_at = NOW()
+         WHERE id = $1`,
+        [deliveryId, error.slice(0, 500)],
+      );
+      await client.query('COMMIT');
+    } catch (caught) {
+      await client.query('ROLLBACK');
+      throw caught;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listDueExpoReceipts(limit: number): Promise<ExpoReceipt[]> {
+    const result = await this.pool.query<QueryResultRow & {
+      id: string;
+      expo_ticket_id: string;
+      attempt_count: number;
+    }>(
+      `WITH candidates AS (
+         SELECT id FROM notification_push_outbox
+         WHERE status = 'submitted' AND receipt_check_at <= NOW()
+         ORDER BY receipt_check_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT $1
+       )
+       UPDATE notification_push_outbox o
+       SET receipt_check_at = NOW() + INTERVAL '15 minutes', updated_at = NOW()
+       FROM candidates c
+       WHERE o.id = c.id
+       RETURNING o.id, o.expo_ticket_id, o.attempt_count`,
+      [Math.min(Math.max(limit, 1), 300)],
+    );
+    return result.rows.flatMap(row => row.expo_ticket_id
+      ? [{ id: row.id, ticketId: row.expo_ticket_id, attemptCount: row.attempt_count }]
+      : []);
+  }
+
+  async markExpoReceiptDelivered(deliveryId: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE notification_push_outbox
+       SET status = 'delivered', receipt_check_at = NULL, last_error = NULL, updated_at = NOW()
+       WHERE id = $1 AND status = 'submitted'`,
+      [deliveryId],
+    );
+  }
+
+  async markExpoReceiptFailed(deliveryId: string, error: string, deactivateToken: boolean): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      if (deactivateToken) {
+        await client.query(
+          `UPDATE notification_push_tokens SET revoked_at = COALESCE(revoked_at, NOW())
+           WHERE id = (SELECT push_token_id FROM notification_push_outbox WHERE id = $1)`,
+          [deliveryId],
+        );
+      }
+      await client.query(
+        `UPDATE notification_push_outbox
+         SET status = 'failed', receipt_check_at = NULL, last_error = $2, updated_at = NOW()
+         WHERE id = $1 AND status = 'submitted'`,
+        [deliveryId, error.slice(0, 500)],
+      );
+      await client.query('COMMIT');
+    } catch (caught) {
+      await client.query('ROLLBACK');
+      throw caught;
+    } finally {
+      client.release();
+    }
+  }
+
+  async cleanupNotifications(): Promise<void> {
+    await this.pool.query('DELETE FROM notifications WHERE expires_at <= NOW()');
+    await this.pool.query(
+      `DELETE FROM notification_push_tokens
+       WHERE (revoked_at IS NOT NULL AND revoked_at < NOW() - INTERVAL '90 days')
+          OR (revoked_at IS NULL AND last_seen_at < NOW() - INTERVAL '90 days')`,
+    );
   }
 
   async listEvents(userId: string): Promise<MemberEvent[]> {
@@ -849,6 +1427,7 @@ export class PostgresStore implements Store {
     try {
       await client.query('BEGIN');
       const eventResult = await client.query<QueryResultRow & {
+        title: string;
         starts_at: Date;
         capacity: number | null;
         rsvp_open: boolean;
@@ -857,7 +1436,7 @@ export class PostgresStore implements Store {
         recurrence_until: string | null;
         active: boolean;
       }>(
-        `SELECT starts_at, capacity, rsvp_open, bracket_enabled, recurrence,
+        `SELECT title, starts_at, capacity, rsvp_open, bracket_enabled, recurrence,
                 recurrence_until::TEXT AS recurrence_until, active
          FROM events WHERE id = $1 FOR UPDATE`,
         [eventId],
@@ -901,6 +1480,15 @@ export class PostgresStore implements Store {
         'INSERT INTO event_rsvps (event_id, occurrence_start, user_id) VALUES ($1, $2, $3)',
         [eventId, occurrenceStart, userId],
       );
+      await this.createNotification(client, {
+        userId,
+        category: 'rsvp',
+        type: 'rsvp_confirmed',
+        title: 'RSVP confirmed',
+        body: `You're on the guest list for ${event.title}.`,
+        data: { screen: 'Events', eventId, occurrenceStart },
+        dedupeKey: `rsvp-confirmed:${randomUUID()}`,
+      });
       await client.query('COMMIT');
       return 'rsvped';
     } catch (error) {
@@ -937,6 +1525,17 @@ export class PostgresStore implements Store {
         'DELETE FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2 AND user_id = $3',
         [eventId, occurrenceStart, userId],
       );
+      if (result.rowCount) {
+        await this.createNotification(client, {
+          userId,
+          category: 'rsvp',
+          type: 'rsvp_cancelled',
+          title: 'RSVP canceled',
+          body: `Your RSVP for ${event.title} was canceled.`,
+          data: { screen: 'Events', eventId, occurrenceStart },
+          dedupeKey: `rsvp-cancelled:${randomUUID()}`,
+        });
+      }
       await client.query('COMMIT');
       return Boolean(result.rowCount);
     } catch (error) {
@@ -1714,6 +2313,32 @@ export class PostgresStore implements Store {
         ],
       );
       const event = toEvent(result.rows[0]);
+      const eventChangesAffectMembers = current.title !== event.title ||
+        current.starts_at.getTime() !== new Date(event.startsAt).getTime() ||
+        current.description !== event.description || current.tag !== event.tag;
+      if (eventChangesAffectMembers) {
+        const attendees = await client.query<QueryResultRow & {
+          user_id: string;
+          occurrence_start: Date;
+        }>(
+          `SELECT DISTINCT user_id, occurrence_start FROM event_rsvps
+           WHERE event_id = $1 AND occurrence_start > NOW()`,
+          [eventId],
+        );
+        const operationId = randomUUID();
+        for (const attendee of attendees.rows) {
+          const occurrenceStart = attendee.occurrence_start.toISOString();
+          await this.createNotification(client, {
+            userId: attendee.user_id,
+            category: 'event',
+            type: 'event_changed',
+            title: 'Event updated',
+            body: `${event.title} has changed. Check the event details for the latest information.`,
+            data: { screen: 'Events', eventId, occurrenceStart },
+            dedupeKey: `event-update:${eventId}:${occurrenceStart}:${operationId}`,
+          });
+        }
+      }
       await this.writeAudit(client, actorId, 'event.update', 'event', eventId, {
         before: toEvent(current),
         after: event,
@@ -1732,6 +2357,15 @@ export class PostgresStore implements Store {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      const attendees = await client.query<QueryResultRow & {
+        user_id: string;
+        occurrence_start: Date;
+      }>(
+        `SELECT DISTINCT r.user_id, r.occurrence_start
+         FROM event_rsvps r JOIN events e ON e.id = r.event_id
+         WHERE r.event_id = $1 AND r.occurrence_start > NOW() AND e.active = TRUE`,
+        [eventId],
+      );
       const result = await client.query<EventRow>(
         `UPDATE events SET active = FALSE, rsvp_open = FALSE, updated_at = NOW()
          WHERE id = $1 AND active = TRUE
@@ -1741,6 +2375,19 @@ export class PostgresStore implements Store {
       );
       const event = result.rows[0];
       if (!event) throw new StoreError('event_not_found', 'Event not found or already archived.');
+      const operationId = randomUUID();
+      for (const attendee of attendees.rows) {
+        const occurrenceStart = attendee.occurrence_start.toISOString();
+        await this.createNotification(client, {
+          userId: attendee.user_id,
+          category: 'event',
+          type: 'event_cancelled',
+          title: 'Event canceled',
+          body: `${event.title} has been canceled.`,
+          data: { screen: 'Events', eventId, occurrenceStart },
+          dedupeKey: `event-cancelled:${eventId}:${occurrenceStart}:${operationId}`,
+        });
+      }
       await this.writeAudit(client, actorId, 'event.archive', 'event', eventId, {
         after: toEvent(event),
       });

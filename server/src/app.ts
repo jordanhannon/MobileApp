@@ -2,7 +2,10 @@ import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
-import type { Account, EventInput, Reward, SocialIdentityProvider, UserRole } from './domain.js';
+import type {
+  Account, AnnouncementAudience, EventInput, NotificationPreferences, PushPlatform,
+  Reward, SocialIdentityProvider, UserRole,
+} from './domain.js';
 import { StoreError } from './domain.js';
 import {
   createEmailCode, createId, createOpaqueToken, hashEmailCode, hashOpaqueToken, hashPassword, normalizeEmail, verifyPassword,
@@ -204,6 +207,43 @@ function rewardInput(body: Record<string, unknown>, id?: string): Reward {
     pointsCost,
     icon: stringField(body, 'icon', 1, 16),
   };
+}
+
+function notificationPreferencesInput(body: Record<string, unknown>): NotificationPreferences {
+  const booleanFields = [
+    'rsvpUpdatesEnabled', 'eventChangesEnabled', 'rewardsEnabled',
+    'announcementsEnabled', 'pushEnabled',
+  ] as const;
+  for (const field of booleanFields) {
+    if (typeof body[field] !== 'boolean') {
+      throw new ApiError(400, 'invalid_request', `Invalid ${field}.`);
+    }
+  }
+  const reminderSchedule = body.reminderSchedule;
+  if (reminderSchedule !== 'off' && reminderSchedule !== '24h' &&
+    reminderSchedule !== '1h' && reminderSchedule !== '24h_1h') {
+    throw new ApiError(400, 'invalid_request', 'Invalid reminder schedule.');
+  }
+  return {
+    rsvpUpdatesEnabled: body.rsvpUpdatesEnabled as boolean,
+    eventChangesEnabled: body.eventChangesEnabled as boolean,
+    rewardsEnabled: body.rewardsEnabled as boolean,
+    announcementsEnabled: body.announcementsEnabled as boolean,
+    pushEnabled: body.pushEnabled as boolean,
+    reminderSchedule,
+  };
+}
+
+function announcementAudienceInput(body: Record<string, unknown>): AnnouncementAudience {
+  if (body.type === 'all') return { type: 'all' };
+  if (body.type !== 'event') throw new ApiError(400, 'invalid_request', 'Choose a supported announcement audience.');
+  const eventId = slugParameter(stringField(body, 'eventId', 2, 80));
+  const occurrenceInput = stringField(body, 'occurrenceStart', 1, 40);
+  const occurrenceStart = new Date(occurrenceInput);
+  if (!/(Z|[+-]\d{2}:\d{2})$/i.test(occurrenceInput) || !Number.isFinite(occurrenceStart.getTime())) {
+    throw new ApiError(400, 'invalid_request', 'Invalid event occurrence.');
+  }
+  return { type: 'event', eventId, occurrenceStart: occurrenceStart.toISOString() };
 }
 
 function nativeTransport(request: FastifyRequest): boolean {
@@ -507,6 +547,70 @@ export function createApp({ config, store, emailSender, socialTokenVerifier = ne
     return { account: request.account };
   });
 
+  app.get('/api/notifications', { preHandler: requireAccount }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const page = pagination(request);
+    return {
+      ...await store.listNotifications(request.account.id, page.limit, page.offset),
+      page: page.page,
+      pageSize: page.limit,
+    };
+  });
+
+  app.post('/api/notifications/read-all', { preHandler: requireAccount }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    return { updated: await store.markAllNotificationsRead(request.account.id) };
+  });
+
+  app.post('/api/notifications/:notificationId/read', { preHandler: requireAccount }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const notificationId = uuidParameter(routeParameter(request, 'notificationId', 36));
+    if (!await store.markNotificationRead(request.account.id, notificationId)) {
+      throw new ApiError(404, 'notification_not_found', 'Notification not found.');
+    }
+    return { read: true };
+  });
+
+  app.get('/api/notifications/preferences', { preHandler: requireAccount }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    return { preferences: await store.getNotificationPreferences(request.account.id) };
+  });
+
+  app.post('/api/notifications/preferences', { preHandler: requireAccount }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    return {
+      preferences: await store.updateNotificationPreferences(
+        request.account.id,
+        notificationPreferencesInput(bodyRecord(request.body)),
+      ),
+    };
+  });
+
+  app.post('/api/notifications/push-token', { preHandler: requireAccount }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const body = bodyRecord(request.body);
+    const token = stringField(body, 'token', 20, 500);
+    if (!/^(Exponent|Expo)PushToken\[[A-Za-z0-9._-]{1,250}\]$/.test(token)) {
+      throw new ApiError(400, 'invalid_request', 'Invalid Expo push token.');
+    }
+    const platform = body.platform;
+    if (platform !== 'ios' && platform !== 'android') {
+      throw new ApiError(400, 'invalid_request', 'Invalid push token platform.');
+    }
+    await store.registerPushToken(request.account.id, token, platform as PushPlatform);
+    return { registered: true };
+  });
+
+  app.delete('/api/notifications/push-token', { preHandler: requireAccount }, async request => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const token = stringField(bodyRecord(request.body), 'token', 20, 500);
+    if (!/^(Exponent|Expo)PushToken\[[A-Za-z0-9._-]{1,250}\]$/.test(token)) {
+      throw new ApiError(400, 'invalid_request', 'Invalid Expo push token.');
+    }
+    await store.revokePushToken(request.account.id, token);
+    return { revoked: true };
+  });
+
   app.get('/api/rewards', { preHandler: requireAccount }, async () => ({ rewards: await store.listRewards() }));
 
   app.get('/api/events', { preHandler: requireAccount }, async request => {
@@ -708,6 +812,26 @@ export function createApp({ config, store, emailSender, socialTokenVerifier = ne
     const eventId = slugParameter(routeParameter(request, 'eventId', 80));
     await store.archiveEvent(request.account.id, eventId);
     return { archived: true };
+  });
+
+  app.post('/api/admin/announcements', { preHandler: requireRole('staff', 'admin') }, async (request, reply) => {
+    if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
+    const idempotencyKey = request.headers['idempotency-key'];
+    if (typeof idempotencyKey !== 'string' || idempotencyKey.length < 8 || idempotencyKey.length > 128) {
+      throw new ApiError(400, 'invalid_request', 'A valid idempotency key is required.');
+    }
+    const body = bodyRecord(request.body);
+    const title = stringField(body, 'title', 1, 120).trim();
+    const message = stringField(body, 'body', 1, 1000).trim();
+    if (!title || !message) throw new ApiError(400, 'invalid_request', 'Announcement title and message are required.');
+    const result = await store.createAnnouncement(
+      request.account.id,
+      title,
+      message,
+      announcementAudienceInput(bodyRecord(body.audience)),
+      idempotencyKey,
+    );
+    return reply.code(result.alreadyApplied ? 200 : 201).send(result);
   });
 
   app.get('/api/admin/rewards', { preHandler: requireRole('admin') }, async () => ({
