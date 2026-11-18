@@ -19,6 +19,7 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
   const email = `integration-${userId}@example.test`;
   const adminEmail = `integration-admin-${adminId}@example.test`;
   const eventId = `integration-${userId.slice(0, 8)}`;
+  const pastEventId = `past-${userId.slice(0, 8)}`;
   const monthlyEventId = `monthly-${userId.slice(0, 8)}`;
   const bracketEventId = `bracket-${userId.slice(0, 8)}`;
   const rewardId = `integration-${userId.slice(0, 8)}`;
@@ -209,6 +210,26 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
     assert.equal('email' in attendees.attendees[0], false);
     const secondAttendees = await store.listEventAttendees(eventId, secondOccurrence, 10, 0);
     assert.equal(secondAttendees.total, 1);
+
+    await store.createEvent(adminId, {
+      id: pastEventId,
+      title: 'Past Integration Event',
+      startsAt: '2026-03-07T16:30:00.000Z',
+      description: 'Past calendar occurrence and RSVP cutoff test.',
+      tag: 'TEST',
+      capacity: null,
+      rsvpOpen: true,
+      bracketEnabled: false,
+      recurrence: 'none',
+      recurrenceUntil: null,
+    });
+    const pastMonthEvents = await store.listEventsForMonth(userId, '2026-03-01');
+    assert.ok(pastMonthEvents.some(item => item.id === pastEventId));
+    await assert.rejects(
+      () => store.rsvpToEvent(userId, pastEventId, '2026-03-07T16:30:00.000Z'),
+      { code: 'rsvp_closed' },
+    );
+
     await assert.rejects(
       () => store.updateEvent(adminId, eventId, {
         id: eventId,
@@ -412,6 +433,7 @@ test('PostgreSQL persists auth, roles, reporting, RSVPs, audited management, and
     await pool.query('DELETE FROM events WHERE id = $1', [bracketEventId]);
     await pool.query('DELETE FROM event_rsvps WHERE event_id = $1', [eventId]);
     await pool.query('DELETE FROM events WHERE id = $1', [eventId]);
+    await pool.query('DELETE FROM events WHERE id = $1', [pastEventId]);
     await pool.query('DELETE FROM event_rsvps WHERE event_id = $1', [monthlyEventId]);
     await pool.query('DELETE FROM events WHERE id = $1', [monthlyEventId]);
     await pool.query('DELETE FROM rewards WHERE id = $1', [rewardId]);

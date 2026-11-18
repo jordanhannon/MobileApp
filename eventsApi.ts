@@ -24,6 +24,11 @@ export async function fetchEvents(): Promise<AppEvent[]> {
   return response.events;
 }
 
+export async function fetchEventsForMonth(month: string): Promise<AppEvent[]> {
+  const response = await apiRequest<{ events: AppEvent[] }>(`/events?month=${encodeURIComponent(month)}`);
+  return response.events;
+}
+
 export async function rsvpToEvent(eventId: string, occurrenceStart: string): Promise<void> {
   await apiRequest(`/events/${encodeURIComponent(eventId)}/rsvp`, {
     method: 'POST',

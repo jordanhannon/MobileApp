@@ -512,6 +512,13 @@ export function createApp({ config, store, emailSender, socialTokenVerifier = ne
   app.get('/api/events', { preHandler: requireAccount }, async request => {
     if (!request.account) throw new ApiError(401, 'unauthorized', 'Sign in to continue.');
     await store.finalizeDueBrackets();
+    const query = bodyRecord(request.query);
+    if (query.month !== undefined) {
+      if (typeof query.month !== 'string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(query.month) || Number(query.month.slice(0, 4)) < 1) {
+        throw new ApiError(400, 'invalid_request', 'Invalid month.');
+      }
+      return { events: await store.listEventsForMonth(request.account.id, `${query.month}-01`) };
+    }
     return { events: await store.listEvents(request.account.id) };
   });
 

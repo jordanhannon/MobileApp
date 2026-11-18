@@ -48,7 +48,7 @@ class MemoryStore implements Store {
     {
       id: 'tasting',
       title: 'A taste of the season',
-      startsAt: new Date(Date.now() + 60_000).toISOString(),
+      startsAt: new Date(Date.now() + 3_600_000).toISOString(),
       description: 'Meet our seasonal favorites with a tasting made for our members.',
       tag: 'MEMBER EXCLUSIVE',
       capacity: null,
@@ -253,15 +253,20 @@ class MemoryStore implements Store {
     }));
   }
 
+  async listEventsForMonth(userId: string, monthStart: string): Promise<MemberEvent[]> {
+    const month = monthStart.slice(0, 7);
+    return (await this.listEvents(userId)).filter(event => event.occurrenceStart.slice(0, 7) === month);
+  }
+
   async rsvpToEvent(userId: string, eventId: string, occurrenceStart: string): Promise<'rsvped' | 'already_rsvped'> {
     const event = this.events.find(item => item.id === eventId && item.active);
     if (!event) throw new StoreError('event_not_found', 'Event not found.');
+    if (Date.parse(occurrenceStart) <= Date.now()) {
+      throw new StoreError('rsvp_closed', 'RSVPs are closed for this event occurrence.');
+    }
     const key = `${eventId}:${occurrenceStart}`;
     const attendees = this.rsvps.get(key) ?? new Set<string>();
     if (attendees.has(userId)) return 'already_rsvped';
-    if (event.bracketEnabled && Date.parse(occurrenceStart) <= Date.now()) {
-      throw new StoreError('rsvp_closed', 'RSVPs are closed for this event occurrence.');
-    }
     if (!event.bracketEnabled && !event.rsvpOpen) {
       throw new StoreError('rsvp_closed', 'RSVPs are closed for this event.');
     }
@@ -871,6 +876,37 @@ test('staff and admin routes enforce roles, return limited data, and audit privi
   const memberAuth = auth('rbac-member-access');
   const staffAuth = auth('rbac-staff-access');
   const adminAuth = auth('rbac-admin-access');
+
+  const pastOccurrence = '2025-11-18T16:00:00.000Z';
+  const pastEvent = {
+    ...store.events[0],
+    id: 'past-tasting',
+    title: 'Past tasting',
+    startsAt: pastOccurrence,
+    bracketEnabled: false,
+  };
+  store.events.push(pastEvent);
+  const pastEvents = await app.inject({
+    method: 'GET',
+    url: '/api/events?month=2025-11',
+    headers: memberAuth,
+  });
+  assert.equal(pastEvents.statusCode, 200);
+  assert.ok(pastEvents.json<{ events: MemberEvent[] }>().events.some(event => event.id === pastEvent.id));
+  assert.equal((await app.inject({
+    method: 'GET',
+    url: '/api/events?month=2025-13',
+    headers: memberAuth,
+  })).statusCode, 400);
+  const pastRsvp = await app.inject({
+    method: 'POST',
+    url: '/api/events/past-tasting/rsvp',
+    headers: memberAuth,
+    payload: { occurrenceStart: pastOccurrence },
+  });
+  assert.equal(pastRsvp.statusCode, 409);
+  assert.equal(pastRsvp.json<{ error: { code: string } }>().error.code, 'rsvp_closed');
+  store.events.splice(store.events.indexOf(pastEvent), 1);
 
   assert.equal((await app.inject({ method: 'GET', url: '/api/admin/users?q=rbac' })).statusCode, 401);
   assert.equal((await app.inject({ method: 'GET', url: '/api/admin/points', headers: memberAuth })).statusCode, 403);

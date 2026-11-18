@@ -14,13 +14,15 @@ import { beginAppleSignIn, beginGoogleSignIn } from './socialSignIn';
 import { fetchRewards, redeemReward as submitRewardRedemption, Reward } from './rewardsApi';
 import StaffDashboard from './StaffDashboard';
 import TournamentBrackets from './TournamentBrackets';
-import { cancelEventRsvp, fetchEvents, rsvpToEvent, type AppEvent } from './eventsApi';
-import { EVENT_TIME_ZONE } from './easternDateTime';
+import { cancelEventRsvp, fetchEvents, fetchEventsForMonth, rsvpToEvent, type AppEvent } from './eventsApi';
+import { easternDatePart, EVENT_TIME_ZONE } from './easternDateTime';
 import { ThemeProvider, useAppTheme } from './theme';
+import EventsCalendar from './EventsCalendar';
 
 type Tab = 'Events' | 'Bracket' | 'Menu' | 'Rewards' | 'Staff';
 type Category = 'All' | 'Food' | 'Drinks';
 type AuthMode = 'login' | 'signup' | 'verify' | 'forgot' | 'reset' | 'social_profile';
+type EventView = 'list' | 'calendar';
 
 const tabs: { name: Tab; icon: string }[] = [
   { name: 'Events', icon: '◷' },
@@ -471,6 +473,14 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
   const [category, setCategory] = useState<Category>('All');
   const [events, setEvents] = useState<AppEvent[]>([]);
   const [loadingEvents, setLoadingEvents] = useState(true);
+  const [calendarEvents, setCalendarEvents] = useState<AppEvent[]>([]);
+  const [loadingCalendarEvents, setLoadingCalendarEvents] = useState(false);
+  const [eventView, setEventView] = useState<EventView>('list');
+  const [eventPage, setEventPage] = useState(0);
+  const [calendarMonth, setCalendarMonth] = useState(() => {
+    return easternDatePart(new Date().toISOString()).slice(0, 7);
+  });
+  const [selectedCalendarDay, setSelectedCalendarDay] = useState<string | null>(null);
   const [rsvpPendingId, setRsvpPendingId] = useState<string | null>(null);
   const [points, setPoints] = useState(account.rewardPoints);
   const [rewards, setRewards] = useState<Reward[]>([]);
@@ -480,6 +490,25 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
   const [notice, setNotice] = useState('');
   const [redeeming, setRedeeming] = useState(false);
   const [redemptionRequest, setRedemptionRequest] = useState<{ rewardId: string; key: string } | null>(null);
+  const sortedEvents = useMemo(
+    () => [...events].sort((a, b) => Date.parse(a.occurrenceStart) - Date.parse(b.occurrenceStart)),
+    [events],
+  );
+  const upcomingEvents = sortedEvents.filter(event => Date.parse(event.occurrenceStart) >= Date.now());
+  const pageCount = Math.ceil(upcomingEvents.length / 5);
+  const activeEventPage = Math.min(eventPage, Math.max(pageCount - 1, 0));
+  const pageEvents = upcomingEvents.slice(activeEventPage * 5, activeEventPage * 5 + 5);
+  const monthEvents = useMemo(
+    () => [...calendarEvents].sort((a, b) => Date.parse(a.occurrenceStart) - Date.parse(b.occurrenceStart)),
+    [calendarEvents],
+  );
+  const selectedCalendarDate = selectedCalendarDay?.startsWith(`${calendarMonth}-`)
+    ? selectedCalendarDay
+    : monthEvents.length > 0
+      ? easternDatePart(monthEvents[0].occurrenceStart)
+      : `${calendarMonth}-01`;
+  const selectedDateEvents = monthEvents.filter(event =>
+    easternDatePart(event.occurrenceStart) === selectedCalendarDate);
 
   useEffect(() => {
     let active = true;
@@ -494,6 +523,24 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
       .finally(() => { if (active) setLoadingEvents(false); });
     return () => { active = false; };
   }, [tab]);
+
+  useEffect(() => {
+    let active = true;
+    if (tab !== 'Events' || eventView !== 'calendar') return () => { active = false; };
+    setCalendarEvents([]);
+    setLoadingCalendarEvents(true);
+    fetchEventsForMonth(calendarMonth)
+      .then(items => { if (active) setCalendarEvents(items); })
+      .catch(error => {
+        console.error('Unable to load events for the calendar month.', error);
+        if (active) {
+          setCalendarEvents([]);
+          setNotice(error instanceof ApiError ? error.message : 'We could not load calendar events. Please try again.');
+        }
+      })
+      .finally(() => { if (active) setLoadingCalendarEvents(false); });
+    return () => { active = false; };
+  }, [tab, eventView, calendarMonth]);
 
   useEffect(() => {
     let active = true;
@@ -520,7 +567,12 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
     try {
       if (event.reserved) await cancelEventRsvp(event.id, event.occurrenceStart);
       else await rsvpToEvent(event.id, event.occurrenceStart);
-      setEvents(await fetchEvents());
+      const [upcoming, monthItems] = await Promise.all([
+        fetchEvents(),
+        eventView === 'calendar' ? fetchEventsForMonth(calendarMonth) : Promise.resolve(null),
+      ]);
+      setEvents(upcoming);
+      if (monthItems) setCalendarEvents(monthItems);
       setNotice(event.reserved ? 'Your RSVP was canceled.' : 'You’re on the guest list!');
     } catch (error) {
       console.error('Unable to update the event RSVP.', error);
@@ -553,6 +605,53 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
     } finally {
       setRedeeming(false);
     }
+  }
+
+  function renderEventCard(event: AppEvent) {
+    const reserved = event.reserved;
+    const startsAt = new Date(event.occurrenceStart);
+    const month = startsAt.toLocaleString('en-US', { month: 'short', timeZone: EVENT_TIME_ZONE }).toUpperCase();
+    const day = startsAt.toLocaleString('en-US', { day: 'numeric', timeZone: EVENT_TIME_ZONE });
+    const date = startsAt.toLocaleDateString('en-US', {
+      weekday: 'long', month: 'short', day: 'numeric', year: 'numeric', timeZone: EVENT_TIME_ZONE,
+    });
+    const time = startsAt.toLocaleTimeString('en-US', {
+      hour: 'numeric', minute: '2-digit', timeZone: EVENT_TIME_ZONE, timeZoneName: 'short',
+    });
+    const occurrenceKey = `${event.id}:${event.occurrenceStart}`;
+    const full = event.capacity !== null && event.attendeeCount >= event.capacity && !reserved;
+    const closed = !event.rsvpOpen && !reserved;
+    const past = Date.parse(event.occurrenceStart) <= Date.now();
+    const rsvpDisabled = past || rsvpPendingId === occurrenceKey || closed || full;
+    return (
+      <View key={occurrenceKey} style={styles.card}>
+        <View style={styles.eventTop}>
+          <View style={styles.dateBadge}>
+            <Text style={styles.dateMonth}>{month}</Text>
+            <Text style={styles.dateDay}>{day}</Text>
+          </View>
+          <Text style={styles.tag}>{event.tag}</Text>
+        </View>
+        <Text accessibilityRole="header" style={styles.cardTitle}>{event.title}</Text>
+        <Text style={styles.eventTime}>{date} · {time}</Text>
+        {event.recurrence !== 'none' && (
+          <Text style={styles.muted}>Part of a {event.recurrence} series · RSVP for this date</Text>
+        )}
+        <Text style={styles.description}>{event.description}</Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={past ? `${event.title} has passed` : `${reserved ? 'Cancel reservation for' : 'RSVP to'} ${event.title} on ${date}`}
+          accessibilityState={{ disabled: rsvpDisabled }}
+          disabled={rsvpDisabled}
+          onPress={() => void toggleReservation(event)}
+          style={({ pressed }) => [styles.button, (past || reserved || closed || full) && styles.secondaryButton, pressed && styles.pressed]}
+        >
+          <Text style={[styles.buttonText, (past || reserved || closed || full) && styles.secondaryButtonText]}>
+            {past ? 'Event has passed' : reserved ? 'You’re going · Cancel RSVP' : closed ? 'RSVPs closed' : full ? 'Event is full' : 'Count me in  →'}
+          </Text>
+        </Pressable>
+      </View>
+    );
   }
 
   const visibleTabs = account.role === 'member'
@@ -621,54 +720,75 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
               </View>
               <View style={styles.sectionHeading}>
                 <Text accessibilityRole="header" style={styles.sectionTitle}>Upcoming events</Text>
-                <Text style={styles.muted}>{events.length} to look forward to</Text>
+                <Text style={styles.muted}>{upcomingEvents.length} to look forward to</Text>
+              </View>
+              <View accessibilityRole="tablist" style={styles.filters}>
+                {([
+                  ['list', 'List'],
+                  ['calendar', 'Calendar'],
+                ] as const).map(([value, label]) => (
+                  <Pressable
+                    key={value}
+                    accessibilityRole="tab"
+                    accessibilityState={{ selected: eventView === value }}
+                    onPress={() => setEventView(value)}
+                    style={[styles.filter, eventView === value && styles.activeFilter]}
+                  >
+                    <Text style={[styles.filterText, eventView === value && styles.activeFilterText]}>{label}</Text>
+                  </Pressable>
+                ))}
               </View>
               {loadingEvents && <ActivityIndicator color={colors.brand} />}
-              {!loadingEvents && events.length === 0 && <Text style={styles.muted}>No upcoming events are available right now.</Text>}
-              {events.map(event => {
-                const reserved = event.reserved;
-                const startsAt = new Date(event.startsAt);
-                const month = startsAt.toLocaleString('en-US', { month: 'short', timeZone: EVENT_TIME_ZONE }).toUpperCase();
-                const day = startsAt.toLocaleString('en-US', { day: 'numeric', timeZone: EVENT_TIME_ZONE });
-                const date = startsAt.toLocaleDateString('en-US', {
-                  weekday: 'long', month: 'short', day: 'numeric', year: 'numeric', timeZone: EVENT_TIME_ZONE,
-                });
-                const time = startsAt.toLocaleTimeString('en-US', {
-                  hour: 'numeric', minute: '2-digit', timeZone: EVENT_TIME_ZONE, timeZoneName: 'short',
-                });
-                const occurrenceKey = `${event.id}:${event.occurrenceStart}`;
-                const full = event.capacity !== null && event.attendeeCount >= event.capacity && !reserved;
-                const closed = !event.rsvpOpen && !reserved;
-                return (
-                  <View key={occurrenceKey} style={styles.card}>
-                    <View style={styles.eventTop}>
-                      <View style={styles.dateBadge}>
-                        <Text style={styles.dateMonth}>{month}</Text>
-                        <Text style={styles.dateDay}>{day}</Text>
-                      </View>
-                      <Text style={styles.tag}>{event.tag}</Text>
-                    </View>
-                    <Text accessibilityRole="header" style={styles.cardTitle}>{event.title}</Text>
-                    <Text style={styles.eventTime}>{date} · {time}</Text>
-                    {event.recurrence !== 'none' && (
-                      <Text style={styles.muted}>Part of a {event.recurrence} series · RSVP for this date</Text>
-                    )}
-                    <Text style={styles.description}>{event.description}</Text>
-                    <Pressable
-                      accessibilityRole="button"
-                      accessibilityLabel={`${reserved ? 'Cancel reservation for' : 'RSVP to'} ${event.title} on ${date}`}
-                      accessibilityState={{ disabled: rsvpPendingId === occurrenceKey || closed || full }}
-                      disabled={rsvpPendingId === occurrenceKey || closed || full}
-                      onPress={() => void toggleReservation(event)}
-                      style={({ pressed }) => [styles.button, (reserved || closed || full) && styles.secondaryButton, pressed && styles.pressed]}
-                    >
-                      <Text style={[styles.buttonText, (reserved || closed || full) && styles.secondaryButtonText]}>
-                        {reserved ? 'You’re going · Cancel RSVP' : closed ? 'RSVPs closed' : full ? 'Event is full' : 'Count me in  →'}
-                      </Text>
-                    </Pressable>
-                  </View>
-                );
-              })}
+              {!loadingEvents && eventView === 'list' && upcomingEvents.length === 0 && <Text style={styles.muted}>No upcoming events are available right now.</Text>}
+              {!loadingEvents && upcomingEvents.length > 0 && eventView === 'list' && pageEvents.map(renderEventCard)}
+              {!loadingEvents && upcomingEvents.length > 0 && eventView === 'list' && pageCount > 1 && (
+                <View style={styles.pagination}>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Previous events page"
+                    accessibilityState={{ disabled: activeEventPage === 0 }}
+                    disabled={activeEventPage === 0}
+                    onPress={() => setEventPage(page => Math.max(0, page - 1))}
+                    style={[styles.pageButton, activeEventPage === 0 && styles.pageButtonDisabled]}
+                  >
+                    <Text style={styles.pageButtonText}>Previous</Text>
+                  </Pressable>
+                  <Text style={styles.muted}>Page {activeEventPage + 1} of {pageCount}</Text>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Next events page"
+                    accessibilityState={{ disabled: activeEventPage >= pageCount - 1 }}
+                    disabled={activeEventPage >= pageCount - 1}
+                    onPress={() => setEventPage(page => Math.min(pageCount - 1, page + 1))}
+                    style={[styles.pageButton, activeEventPage >= pageCount - 1 && styles.pageButtonDisabled]}
+                  >
+                    <Text style={styles.pageButtonText}>Next</Text>
+                  </Pressable>
+                </View>
+              )}
+              {!loadingEvents && eventView === 'calendar' && (
+                <>
+                  {loadingCalendarEvents && <ActivityIndicator color={colors.brand} />}
+                  <EventsCalendar
+                    events={monthEvents}
+                    month={calendarMonth}
+                    selectedDate={selectedCalendarDate}
+                    onMonthChange={month => {
+                      setCalendarMonth(month);
+                      setSelectedCalendarDay(null);
+                    }}
+                    onSelectDate={setSelectedCalendarDay}
+                  />
+                  <Text accessibilityRole="header" style={styles.sectionTitle}>
+                    {new Date(`${selectedCalendarDate}T00:00:00Z`).toLocaleDateString('en-US', {
+                      weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC',
+                    })}
+                  </Text>
+                  {selectedDateEvents.length === 0
+                    ? <Text style={styles.muted}>No events scheduled for this date.</Text>
+                    : selectedDateEvents.map(renderEventCard)}
+                </>
+              )}
             </>
           )}
 
@@ -871,6 +991,10 @@ function useAppStyles() {
     activeFilter: { backgroundColor: colors.brand },
     filterText: { color: colors.subtleButtonText, fontWeight: '600', fontSize: 14 },
     activeFilterText: { color: colors.brandText },
+    pagination: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginVertical: 8 },
+    pageButton: { backgroundColor: colors.subtleButton, paddingHorizontal: 14, minHeight: 44, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+    pageButtonDisabled: { opacity: 0.45 },
+    pageButtonText: { color: colors.subtleButtonText, fontSize: 13, fontWeight: '600' },
     menuCard: { flexDirection: 'row', gap: 16, alignItems: 'center', backgroundColor: colors.surface, borderRadius: 18, padding: 16, borderWidth: 1, borderColor: colors.border },
     menuArtwork: { width: 76, height: 90, backgroundColor: colors.surfaceAlt, borderRadius: 14, justifyContent: 'center', alignItems: 'center' },
     menuIcon: { fontSize: 42 },

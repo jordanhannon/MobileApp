@@ -750,6 +750,96 @@ export class PostgresStore implements Store {
     return result.rows.map(toMemberEvent);
   }
 
+  async listEventsForMonth(userId: string, monthStart: string): Promise<MemberEvent[]> {
+    const result = await this.pool.query<EventListRow>(
+      `WITH month_bounds AS (
+         SELECT $2::DATE AS month_start, ($2::DATE + INTERVAL '1 month')::DATE AS month_end
+       ), anchors AS (
+         SELECT e.*,
+                e.starts_at AT TIME ZONE 'America/New_York' AS local_start,
+                bounds.month_start::TIMESTAMP AS local_month_start,
+                bounds.month_end::TIMESTAMP AS local_month_end,
+                bounds.month_start,
+                bounds.month_end
+         FROM events e
+         CROSS JOIN month_bounds bounds
+         WHERE e.active = TRUE
+       ), offsets AS (
+         SELECT anchors.*,
+                ((EXTRACT(YEAR FROM local_month_start)::INTEGER -
+                  EXTRACT(YEAR FROM local_start)::INTEGER) * 12
+                  + EXTRACT(MONTH FROM local_month_start)::INTEGER
+                  - EXTRACT(MONTH FROM local_start)::INTEGER) AS month_offset
+         FROM anchors
+       ), indexed AS (
+         SELECT offsets.*,
+                CASE recurrence
+                  WHEN 'weekly' THEN GREATEST(
+                    0,
+                    FLOOR(EXTRACT(EPOCH FROM (local_month_start - local_start)) / 604800)::INTEGER - 1
+                  )
+                  WHEN 'monthly' THEN GREATEST(0, month_offset - 1)
+                  ELSE 0
+                END AS first_index,
+                CASE recurrence
+                  WHEN 'weekly' THEN GREATEST(
+                    0,
+                    CEIL(EXTRACT(EPOCH FROM (local_month_end - local_start)) / 604800)::INTEGER + 1
+                  )
+                  WHEN 'monthly' THEN GREATEST(0, month_offset + 1)
+                  ELSE 0
+                END AS last_index
+         FROM offsets
+       ), generated AS (
+         SELECT indexed.*,
+                (
+                  local_start + CASE recurrence
+                    WHEN 'weekly' THEN indices.n * INTERVAL '1 week'
+                    WHEN 'monthly' THEN indices.n * INTERVAL '1 month'
+                    ELSE INTERVAL '0'
+                  END
+                ) AT TIME ZONE 'America/New_York' AS occurrence_start
+         FROM indexed
+         CROSS JOIN LATERAL generate_series(first_index, last_index) AS indices(n)
+       ), occurrences AS (
+         SELECT *
+         FROM generated
+         WHERE occurrence_start >= (month_start::TIMESTAMP AT TIME ZONE 'America/New_York')
+           AND occurrence_start < (month_end::TIMESTAMP AT TIME ZONE 'America/New_York')
+           AND (
+             recurrence_until IS NULL
+             OR (occurrence_start AT TIME ZONE 'America/New_York')::DATE <= recurrence_until
+           )
+       )
+       SELECT e.id, e.title, e.starts_at, e.description, e.tag, e.capacity,
+              e.rsvp_open, e.bracket_enabled, e.recurrence,
+              e.recurrence_until::TEXT AS recurrence_until, e.active,
+              e.occurrence_start, b.status AS bracket_status,
+              (
+                SELECT COUNT(*)::INTEGER FROM event_rsvps r
+                WHERE r.event_id = e.id AND r.occurrence_start = e.occurrence_start
+              ) AS attendee_count,
+              (
+                SELECT (
+                  (SELECT COUNT(*) FROM event_rsvps r
+                   WHERE r.event_id = e.id AND r.occurrence_start = e.occurrence_start) +
+                  (SELECT COUNT(*) FROM event_bracket_guests g
+                   WHERE g.event_id = e.id AND g.occurrence_start = e.occurrence_start)
+                )::INTEGER
+              ) AS bracket_participant_count,
+              EXISTS (
+                SELECT 1 FROM event_rsvps r
+                WHERE r.event_id = e.id AND r.occurrence_start = e.occurrence_start AND r.user_id = $1
+              ) AS reserved
+       FROM occurrences e
+       LEFT JOIN tournament_brackets b
+         ON b.event_id = e.id AND b.occurrence_start = e.occurrence_start
+       ORDER BY e.occurrence_start, e.id`,
+      [userId, monthStart],
+    );
+    return result.rows.map(toMemberEvent);
+  }
+
   async rsvpToEvent(
     userId: string,
     eventId: string,
@@ -776,6 +866,14 @@ export class PostgresStore implements Store {
       if (!event || !event.active) throw new StoreError('event_not_found', 'Event not found.');
       await this.assertEventOccurrence(eventId, occurrenceStart, event, client);
 
+      const cutoff = await client.query<QueryResultRow & { open: boolean }>(
+        'SELECT $1::TIMESTAMPTZ > NOW() AS open',
+        [occurrenceStart],
+      );
+      if (!cutoff.rows[0].open) {
+        throw new StoreError('rsvp_closed', 'RSVPs are closed for this event occurrence.');
+      }
+
       const existing = await client.query(
         'SELECT 1 FROM event_rsvps WHERE event_id = $1 AND occurrence_start = $2 AND user_id = $3',
         [eventId, occurrenceStart, userId],
@@ -783,15 +881,6 @@ export class PostgresStore implements Store {
       if (existing.rowCount) {
         await client.query('COMMIT');
         return 'already_rsvped';
-      }
-      if (event.bracket_enabled) {
-        const cutoff = await client.query<QueryResultRow & { open: boolean }>(
-          'SELECT $1::TIMESTAMPTZ > NOW() AS open',
-          [occurrenceStart],
-        );
-        if (!cutoff.rows[0].open) {
-          throw new StoreError('rsvp_closed', 'RSVPs are closed for this event occurrence.');
-        }
       }
       if (!event.bracket_enabled && !event.rsvp_open) {
         throw new StoreError('rsvp_closed', 'RSVPs are closed for this event.');

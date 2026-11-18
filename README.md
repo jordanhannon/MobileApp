@@ -110,9 +110,12 @@ migration first with `npm run migrate --prefix server`.
   New accounts begin with zero points. Purchase and administrative point-credit
   workflows are not implemented yet.
 - Staff and admin access is assigned to existing accounts only. Members can
-  RSVP separately to each one-time or recurring event occurrence. Staff and
-  admins can create, edit, and archive events, including weekly and monthly
-  series with an optional end date; event times use America/New_York and follow
+  browse upcoming events in a list paginated five at a time or in a monthly
+  calendar. Past events remain viewable from the calendar, but RSVPs close when
+  an occurrence starts. Members RSVP separately to each one-time or recurring
+  event occurrence. Staff and admins can create, edit, and archive events,
+  including weekly and monthly series with an optional end date; event times
+  use America/New_York and follow
   daylight-saving changes. The start time and recurrence can be changed before
   participants register. After RSVPs or bracket guests exist, archive the
   series and create a replacement to reschedule it. Staff can also search

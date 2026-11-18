@@ -34,6 +34,7 @@ export interface Store {
   listRewards(): Promise<Reward[]>;
   redeem(userId: string, rewardId: string, idempotencyKey: string): Promise<RedemptionResult>;
   listEvents(userId: string): Promise<MemberEvent[]>;
+  listEventsForMonth(userId: string, monthStart: string): Promise<MemberEvent[]>;
   rsvpToEvent(userId: string, eventId: string, occurrenceStart: string): Promise<'rsvped' | 'already_rsvped'>;
   cancelEventRsvp(userId: string, eventId: string, occurrenceStart: string): Promise<boolean>;
   getEventBracket(eventId: string, occurrenceStart: string): Promise<TournamentBracket>;
