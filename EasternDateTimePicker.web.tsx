@@ -2,20 +2,7 @@ import { createElement, useEffect, useState, type ChangeEvent, type CSSPropertie
 import { Text, View } from 'react-native';
 import type { EasternDateTimePickerProps } from './EasternDateTimePicker';
 import { easternDateTimeParts, easternLocalDateTimeToIso, EVENT_TIME_ZONE } from './easternDateTime';
-
-const fieldStyle: CSSProperties = {
-  backgroundColor: '#FAF9F5',
-  borderColor: '#DDE2D6',
-  borderRadius: 10,
-  borderStyle: 'solid',
-  borderWidth: 1,
-  boxSizing: 'border-box',
-  color: '#233B2B',
-  font: 'inherit',
-  minHeight: 44,
-  padding: '9px 12px',
-  width: '100%',
-};
+import { useAppTheme } from './theme';
 
 function DateInput({
   type,
@@ -28,6 +15,20 @@ function DateInput({
   value: string;
   onChange: (value: string) => void;
 }) {
+  const { colors } = useAppTheme();
+  const fieldStyle: CSSProperties = {
+    backgroundColor: colors.inputBackground,
+    borderColor: colors.border,
+    borderRadius: 10,
+    borderStyle: 'solid',
+    borderWidth: 1,
+    boxSizing: 'border-box',
+    color: colors.text,
+    font: 'inherit',
+    minHeight: 44,
+    padding: '9px 12px',
+    width: '100%',
+  };
   return createElement('input', {
     type,
     'aria-label': label,
@@ -43,6 +44,7 @@ export default function EasternDateTimePicker({
   mode = 'datetime',
   onChange,
 }: EasternDateTimePickerProps) {
+  const { colors } = useAppTheme();
   const [error, setError] = useState('');
   const parts = value.length > 10
     ? easternDateTimeParts(value)
@@ -79,7 +81,7 @@ export default function EasternDateTimePicker({
 
   return (
     <View style={{ gap: 5 }}>
-      <Text style={{ color: '#426046', fontSize: 12, fontWeight: '600' }}>{label} · Eastern Time</Text>
+      <Text style={{ color: colors.brandAccent, fontSize: 12, fontWeight: '600' }}>{label} · Eastern Time</Text>
       {mode === 'date' ? (
         <DateInput type="date" label={label} value={date} onChange={nextDate => update(nextDate, '')} />
       ) : (
@@ -98,8 +100,8 @@ export default function EasternDateTimePicker({
           />
         </View>
       )}
-      {error !== '' && <Text accessibilityLiveRegion="polite" style={{ color: '#A12A24', fontSize: 12 }}>{error}</Text>}
-      <Text style={{ color: '#657064', fontSize: 11 }}>Saved in {EVENT_TIME_ZONE}; daylight-saving changes are handled automatically.</Text>
+      {error !== '' && <Text accessibilityLiveRegion="polite" style={{ color: colors.danger, fontSize: 12 }}>{error}</Text>}
+      <Text style={{ color: colors.muted, fontSize: 11 }}>Saved in {EVENT_TIME_ZONE}; daylight-saving changes are handled automatically.</Text>
     </View>
   );
 }

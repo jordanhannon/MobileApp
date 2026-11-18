@@ -95,6 +95,9 @@ migration first with `npm run migrate --prefix server`.
 
 ## Architecture and production notes
 
+- Appearance follows the device setting by default. Users can choose System,
+  Light, or Dark in the Menu tab; manual choices persist on the device. The
+  shared brand green is `#07702D`, sampled from the provided reference.
 - The app sends registration, email/password and social sign-in, email
   verification, password reset, session, reward-list, and redemption requests
   to the API.

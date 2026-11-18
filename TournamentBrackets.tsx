@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View,
 } from 'react-native';
@@ -9,6 +9,7 @@ import {
 } from './bracketApi';
 import { fetchEvents, type AppEvent } from './eventsApi';
 import { formatEasternDateTime } from './easternDateTime';
+import { useAppTheme } from './theme';
 
 function roundTitle(round: number, total: number): string {
   if (round === total) return 'Final';
@@ -111,6 +112,7 @@ function getMatchPlacements(rounds: TournamentBracket['rounds'], singleSided: bo
 function BracketLine({
   x1, y1, x2, y2,
 }: { x1: number; y1: number; x2: number; y2: number }) {
+  const styles = useBracketStyles();
   const horizontal = y1 === y2;
   return (
     <View
@@ -195,6 +197,7 @@ function BracketMatchCard({
   pending: boolean;
   onChooseWinner: (matchId: string, winnerEntrantId: string) => void;
 }) {
+  const styles = useBracketStyles();
   return (
     <View accessibilityLabel={`Match ${match.matchNumber}`} style={styles.matchCard}>
       {[match.playerOne, match.playerTwo].map((player, playerIndex) => {
@@ -247,6 +250,7 @@ function BracketTree({
   singleSided: boolean;
   onChooseWinner: (matchId: string, winnerEntrantId: string) => void;
 }) {
+  const styles = useBracketStyles();
   if (bracket.rounds.length === 0) {
     return bracket.championEntrantId ? (
       <View style={styles.soloChampion}>
@@ -382,6 +386,8 @@ function BracketTree({
 }
 
 export default function TournamentBrackets({ account }: { account: Account }) {
+  const { colors } = useAppTheme();
+  const styles = useBracketStyles();
   const { width: screenWidth } = useWindowDimensions();
   const [events, setEvents] = useState<AppEvent[]>([]);
   const [bracket, setBracket] = useState<TournamentBracket | null>(null);
@@ -545,7 +551,7 @@ export default function TournamentBrackets({ account }: { account: Account }) {
     <View style={styles.container}>
       <Text accessibilityRole="header" style={styles.heading}>Pool tournament</Text>
       <Text style={styles.muted}>The bracket opens automatically when RSVPs close at the event start.</Text>
-      {loading && <ActivityIndicator color="#234D38" />}
+      {loading && <ActivityIndicator color={colors.brand} />}
       {!loading && !selectedEvent && (
         <Text style={styles.muted}>
           {bracketEvents.length === 0
@@ -585,6 +591,7 @@ export default function TournamentBrackets({ account }: { account: Account }) {
                       accessibilityLabel="Guest player name"
                       maxLength={120}
                       placeholder="Guest name"
+                      placeholderTextColor={colors.muted}
                       value={guestName}
                       onChangeText={setGuestName}
                       style={styles.guestInput}
@@ -595,7 +602,7 @@ export default function TournamentBrackets({ account }: { account: Account }) {
                       onPress={() => void addGuest()}
                       style={[styles.action, (pending || guestName.trim() === '') && styles.disabled]}
                     >
-                      {pending ? <ActivityIndicator color="#FFF" /> : <Text style={styles.actionText}>Add</Text>}
+                      {pending ? <ActivityIndicator color={colors.brandText} /> : <Text style={styles.actionText}>Add</Text>}
                     </Pressable>
                   </View>
                   {guests.map(guest => (
@@ -629,47 +636,50 @@ export default function TournamentBrackets({ account }: { account: Account }) {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { gap: 12 },
-  heading: { color: '#173D2B', fontSize: 24, fontWeight: '700' },
-  subheading: { color: '#173D2B', fontSize: 18, fontWeight: '700' },
-  muted: { color: '#68736B', fontSize: 13, lineHeight: 19 },
-  panel: { backgroundColor: '#FFF', borderRadius: 16, gap: 12, padding: 16 },
-  error: { color: '#A12A24', fontSize: 14 },
-  notice: { color: '#234D38', fontSize: 14 },
-  action: { alignItems: 'center', backgroundColor: '#234D38', borderRadius: 12, minHeight: 44, justifyContent: 'center', padding: 10 },
-  disabled: { opacity: 0.55 },
-  actionText: { color: '#FFF', fontWeight: '700' },
-  entrantList: { borderTopColor: '#E5E7DD', borderTopWidth: 1, gap: 6, paddingTop: 12 },
-  roundTitle: { color: '#234D38', fontSize: 16, fontWeight: '700' },
-  entrant: { color: '#24352A', fontSize: 14 },
-  guestPanel: { borderTopColor: '#E5E7DD', borderTopWidth: 1, gap: 8, paddingTop: 12 },
-  guestEntry: { flexDirection: 'row', gap: 8 },
-  guestInput: { backgroundColor: '#FAF9F5', borderColor: '#DDE2D6', borderRadius: 10, borderWidth: 1, color: '#24352A', flex: 1, minHeight: 44, paddingHorizontal: 12 },
-  guestRow: { alignItems: 'center', borderTopColor: '#E5E7DD', borderTopWidth: 1, flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8 },
-  removeGuest: { color: '#A12A24', fontSize: 13, fontWeight: '600' },
-  bracketCanvas: { position: 'relative', alignSelf: 'flex-start' },
-  roundLabel: { color: '#234D38', fontSize: 13, fontWeight: '700', position: 'absolute', textAlign: 'center' },
-  connector: { backgroundColor: '#839087', position: 'absolute' },
-  positionedMatch: { height: MATCH_HEIGHT, position: 'absolute', width: MATCH_WIDTH },
-  matchCard: {
-    backgroundColor: '#FFF',
-    borderColor: '#9BA79F',
-    borderRadius: 7,
-    borderWidth: 1,
-    height: MATCH_HEIGHT,
-    overflow: 'hidden',
-    paddingHorizontal: 7,
-    width: MATCH_WIDTH,
-  },
-  playerRow: { alignItems: 'center', flex: 1, flexDirection: 'row', gap: 4 },
-  secondPlayerRow: { borderTopColor: '#DDE2DD', borderTopWidth: 1 },
-  playerName: { color: '#24352A', flex: 1, fontSize: 12, minWidth: 0 },
-  winnerName: { color: '#173D2B', fontWeight: '800' },
-  loserName: { color: '#7A847D' },
-  winnerMark: { color: '#234D38', fontSize: 13, fontWeight: '900' },
-  champion: { alignItems: 'center', flexDirection: 'row', gap: 4, justifyContent: 'center', position: 'absolute' },
-  soloChampion: { alignItems: 'center', borderTopColor: '#E5E7DD', borderTopWidth: 1, flexDirection: 'row', gap: 8, justifyContent: 'center', paddingTop: 12 },
-  championMedal: { fontSize: 24 },
-  championName: { color: '#173D2B', fontSize: 14, fontStyle: 'italic', fontWeight: '800', textAlign: 'center' },
-});
+function useBracketStyles() {
+  const { colors } = useAppTheme();
+  return useMemo(() => StyleSheet.create({
+    container: { gap: 12 },
+    heading: { color: colors.text, fontSize: 24, fontWeight: '700' },
+    subheading: { color: colors.text, fontSize: 18, fontWeight: '700' },
+    muted: { color: colors.muted, fontSize: 13, lineHeight: 19 },
+    panel: { backgroundColor: colors.surface, borderRadius: 16, gap: 12, padding: 16 },
+    error: { color: colors.danger, fontSize: 14 },
+    notice: { color: colors.brandAccent, fontSize: 14 },
+    action: { alignItems: 'center', backgroundColor: colors.brand, borderRadius: 12, minHeight: 44, justifyContent: 'center', padding: 10 },
+    disabled: { opacity: 0.55 },
+    actionText: { color: colors.brandText, fontWeight: '700' },
+    entrantList: { borderTopColor: colors.border, borderTopWidth: 1, gap: 6, paddingTop: 12 },
+    roundTitle: { color: colors.brandAccent, fontSize: 16, fontWeight: '700' },
+    entrant: { color: colors.text, fontSize: 14 },
+    guestPanel: { borderTopColor: colors.border, borderTopWidth: 1, gap: 8, paddingTop: 12 },
+    guestEntry: { flexDirection: 'row', gap: 8 },
+    guestInput: { backgroundColor: colors.inputBackground, borderColor: colors.border, borderRadius: 10, borderWidth: 1, color: colors.text, flex: 1, minHeight: 44, paddingHorizontal: 12 },
+    guestRow: { alignItems: 'center', borderTopColor: colors.border, borderTopWidth: 1, flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8 },
+    removeGuest: { color: colors.danger, fontSize: 13, fontWeight: '600' },
+    bracketCanvas: { position: 'relative', alignSelf: 'flex-start' },
+    roundLabel: { color: colors.brandAccent, fontSize: 13, fontWeight: '700', position: 'absolute', textAlign: 'center' },
+    connector: { backgroundColor: colors.muted, position: 'absolute' },
+    positionedMatch: { height: MATCH_HEIGHT, position: 'absolute', width: MATCH_WIDTH },
+    matchCard: {
+      backgroundColor: colors.surface,
+      borderColor: colors.border,
+      borderRadius: 7,
+      borderWidth: 1,
+      height: MATCH_HEIGHT,
+      overflow: 'hidden',
+      paddingHorizontal: 7,
+      width: MATCH_WIDTH,
+    },
+    playerRow: { alignItems: 'center', flex: 1, flexDirection: 'row', gap: 4 },
+    secondPlayerRow: { borderTopColor: colors.border, borderTopWidth: 1 },
+    playerName: { color: colors.text, flex: 1, fontSize: 12, minWidth: 0 },
+    winnerName: { color: colors.brandAccent, fontWeight: '800' },
+    loserName: { color: colors.muted },
+    winnerMark: { color: colors.brandAccent, fontSize: 13, fontWeight: '900' },
+    champion: { alignItems: 'center', flexDirection: 'row', gap: 4, justifyContent: 'center', position: 'absolute' },
+    soloChampion: { alignItems: 'center', borderTopColor: colors.border, borderTopWidth: 1, flexDirection: 'row', gap: 8, justifyContent: 'center', paddingTop: 12 },
+    championMedal: { fontSize: 24 },
+    championName: { color: colors.brandAccent, fontSize: 14, fontStyle: 'italic', fontWeight: '800', textAlign: 'center' },
+  }), [colors]);
+}

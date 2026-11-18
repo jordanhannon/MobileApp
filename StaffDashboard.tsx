@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { ApiError, Account } from './auth';
 import EasternDateTimePicker from './EasternDateTimePicker';
@@ -11,6 +11,7 @@ import {
   type StaffUser,
 } from './adminApi';
 import { fetchEvents, type AppEvent } from './eventsApi';
+import { useAppTheme } from './theme';
 
 type Section = 'Users' | 'RSVPs' | 'Points' | 'Events' | 'Manage';
 type EventDraft = Omit<ManagedEventInput, 'capacity' | 'recurrenceUntil'> & {
@@ -38,6 +39,8 @@ function eventKey(event: AppEvent): string {
 }
 
 export default function StaffDashboard({ account }: { account: Account }) {
+  const { colors } = useAppTheme();
+  const styles = useStaffStyles();
   const isAdmin = account.role === 'admin';
   const sections: Section[] = isAdmin
     ? ['Users', 'RSVPs', 'Points', 'Manage']
@@ -281,12 +284,6 @@ export default function StaffDashboard({ account }: { account: Account }) {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.heading}>Staff workspace</Text>
-      <Text style={styles.muted}>
-        {isAdmin
-          ? 'Manage events, rewards, and roles; staff reports are read-only.'
-          : 'Manage events, review attendees, and view read-only reports.'}
-      </Text>
       <View style={styles.sectionBar}>
         {sections.map(item => (
           <Pressable
@@ -302,7 +299,7 @@ export default function StaffDashboard({ account }: { account: Account }) {
       </View>
       {error !== '' && <Text accessibilityLiveRegion="polite" style={styles.error}>{error}</Text>}
       {notice !== '' && <Text accessibilityLiveRegion="polite" style={styles.notice}>{notice}</Text>}
-      {pending && <ActivityIndicator color="#234D38" />}
+      {pending && <ActivityIndicator color={colors.brand} />}
 
       {section === 'Users' && (
         <View style={styles.panel}>
@@ -541,6 +538,8 @@ function Field({
   keyboardType?: 'default' | 'numeric';
   onChangeText: (value: string) => void;
 }) {
+  const { colors } = useAppTheme();
+  const styles = useStaffStyles();
   return (
     <View style={styles.field}>
       <Text style={styles.fieldLabel}>{label}</Text>
@@ -551,6 +550,7 @@ function Field({
         multiline={multiline}
         onChangeText={onChangeText}
         placeholder={placeholder}
+        placeholderTextColor={colors.muted}
         style={[styles.input, multiline && styles.multiline, disabled && styles.disabledInput]}
         value={value}
       />
@@ -569,6 +569,7 @@ function ActionButton({
   disabled?: boolean;
   selected?: boolean;
 }) {
+  const styles = useStaffStyles();
   return (
     <Pressable
       accessibilityRole="button"
@@ -583,6 +584,7 @@ function ActionButton({
 }
 
 function Metric({ label, value }: { label: string; value: number }) {
+  const styles = useStaffStyles();
   return (
     <View style={styles.metric}>
       <Text style={styles.metricValue}>{value.toLocaleString()}</Text>
@@ -591,34 +593,37 @@ function Metric({ label, value }: { label: string; value: number }) {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { gap: 14 },
-  heading: { color: '#233B2B', fontSize: 24, fontWeight: '700' },
-  subheading: { color: '#234D38', fontSize: 18, fontWeight: '700' },
-  muted: { color: '#657064', fontSize: 13, lineHeight: 19 },
-  detail: { color: '#233B2B', fontSize: 14, lineHeight: 20 },
-  error: { color: '#A12A24', fontSize: 13, lineHeight: 19 },
-  notice: { color: '#234D38', fontSize: 13, lineHeight: 19 },
-  sectionBar: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  sectionButton: { backgroundColor: '#E9EEDD', borderRadius: 16, paddingHorizontal: 14, paddingVertical: 9 },
-  sectionButtonActive: { backgroundColor: '#234D38' },
-  sectionButtonText: { color: '#426046', fontWeight: '600' },
-  sectionButtonTextActive: { color: '#FFF' },
-  panel: { backgroundColor: '#FFF', borderColor: '#E5E7DD', borderRadius: 16, borderWidth: 1, gap: 12, padding: 16 },
-  card: { backgroundColor: '#FAF9F5', borderColor: '#E5E7DD', borderRadius: 12, borderWidth: 1, gap: 8, padding: 12 },
-  cardTitle: { color: '#233B2B', fontSize: 15, fontWeight: '700' },
-  input: { backgroundColor: '#FAF9F5', borderColor: '#DDE2D6', borderRadius: 10, borderWidth: 1, color: '#233B2B', minHeight: 44, paddingHorizontal: 12, paddingVertical: 9 },
-  multiline: { minHeight: 76, textAlignVertical: 'top' },
-  disabledInput: { opacity: 0.6 },
-  field: { gap: 5 },
-  fieldLabel: { color: '#426046', fontSize: 12, fontWeight: '600' },
-  actionButton: { alignItems: 'center', backgroundColor: '#E9EEDD', borderRadius: 10, justifyContent: 'center', minHeight: 40, paddingHorizontal: 12, paddingVertical: 8 },
-  actionButtonText: { color: '#234D38', fontSize: 13, fontWeight: '600', textAlign: 'center' },
-  selectedButton: { backgroundColor: '#234D38' },
-  selectedButtonText: { color: '#FFF' },
-  disabledButton: { opacity: 0.5 },
-  inlineActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  attendee: { borderBottomColor: '#E5E7DD', borderBottomWidth: 1, gap: 2, paddingVertical: 8 },
-  metric: { backgroundColor: '#FAF9F5', borderRadius: 12, gap: 3, padding: 12 },
-  metricValue: { color: '#234D38', fontSize: 22, fontWeight: '700' },
-});
+function useStaffStyles() {
+  const { colors } = useAppTheme();
+  return useMemo(() => StyleSheet.create({
+    container: { gap: 14 },
+    heading: { color: colors.text, fontSize: 24, fontWeight: '700' },
+    subheading: { color: colors.brandAccent, fontSize: 18, fontWeight: '700' },
+    muted: { color: colors.muted, fontSize: 13, lineHeight: 19 },
+    detail: { color: colors.text, fontSize: 14, lineHeight: 20 },
+    error: { color: colors.danger, fontSize: 13, lineHeight: 19 },
+    notice: { color: colors.brandAccent, fontSize: 13, lineHeight: 19 },
+    sectionBar: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+    sectionButton: { backgroundColor: colors.subtleButton, borderRadius: 16, paddingHorizontal: 14, paddingVertical: 9 },
+    sectionButtonActive: { backgroundColor: colors.brand },
+    sectionButtonText: { color: colors.subtleButtonText, fontWeight: '600' },
+    sectionButtonTextActive: { color: colors.brandText },
+    panel: { backgroundColor: colors.surface, borderColor: colors.border, borderRadius: 16, borderWidth: 1, gap: 12, padding: 16 },
+    card: { backgroundColor: colors.surfaceAlt, borderColor: colors.border, borderRadius: 12, borderWidth: 1, gap: 8, padding: 12 },
+    cardTitle: { color: colors.text, fontSize: 15, fontWeight: '700' },
+    input: { backgroundColor: colors.inputBackground, borderColor: colors.border, borderRadius: 10, borderWidth: 1, color: colors.text, minHeight: 44, paddingHorizontal: 12, paddingVertical: 9 },
+    multiline: { minHeight: 76, textAlignVertical: 'top' },
+    disabledInput: { opacity: 0.6 },
+    field: { gap: 5 },
+    fieldLabel: { color: colors.brandAccent, fontSize: 12, fontWeight: '600' },
+    actionButton: { alignItems: 'center', backgroundColor: colors.subtleButton, borderRadius: 10, justifyContent: 'center', minHeight: 40, paddingHorizontal: 12, paddingVertical: 8 },
+    actionButtonText: { color: colors.subtleButtonText, fontSize: 13, fontWeight: '600', textAlign: 'center' },
+    selectedButton: { backgroundColor: colors.brand },
+    selectedButtonText: { color: colors.brandText },
+    disabledButton: { opacity: 0.5 },
+    inlineActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+    attendee: { borderBottomColor: colors.border, borderBottomWidth: 1, gap: 2, paddingVertical: 8 },
+    metric: { backgroundColor: colors.surfaceAlt, borderRadius: 12, gap: 3, padding: 12 },
+    metricValue: { color: colors.brandAccent, fontSize: 22, fontWeight: '700' },
+  }), [colors]);
+}

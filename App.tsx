@@ -1,7 +1,7 @@
 import { StatusBar } from 'expo-status-bar';
 import * as Crypto from 'expo-crypto';
 import * as AppleAuthentication from 'expo-apple-authentication';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import {
   ActivityIndicator, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View,
@@ -16,6 +16,7 @@ import StaffDashboard from './StaffDashboard';
 import TournamentBrackets from './TournamentBrackets';
 import { cancelEventRsvp, fetchEvents, rsvpToEvent, type AppEvent } from './eventsApi';
 import { EVENT_TIME_ZONE } from './easternDateTime';
+import { ThemeProvider, useAppTheme } from './theme';
 
 type Tab = 'Events' | 'Bracket' | 'Menu' | 'Rewards' | 'Staff';
 type Category = 'All' | 'Food' | 'Drinks';
@@ -36,7 +37,7 @@ const menu = [
   { id: 'lemonade', name: 'Fresh lemonade', description: 'Fresh-squeezed lemons. A sunny little pick-me-up.', price: '$4.50', category: 'Drinks', icon: '🍋' },
 ];
 export default function App() {
-  return <SafeAreaProvider><LoyaltyApp /></SafeAreaProvider>;
+  return <SafeAreaProvider><ThemeProvider><LoyaltyApp /></ThemeProvider></SafeAreaProvider>;
 }
 
 function LoyaltyApp() {
@@ -85,10 +86,12 @@ function LoyaltyApp() {
 }
 
 function LoadingScreen({ message }: { message: string }) {
+  const { colors } = useAppTheme();
+  const styles = useAppStyles();
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.authCentered}>
-        <ActivityIndicator size="large" color="#234D38" />
+        <ActivityIndicator size="large" color={colors.brand} />
         <Text style={styles.authSubtitle}>{message}</Text>
       </View>
     </SafeAreaView>
@@ -96,6 +99,7 @@ function LoadingScreen({ message }: { message: string }) {
 }
 
 function StartupErrorScreen({ message, onRetry }: { message: string; onRetry: () => void }) {
+  const styles = useAppStyles();
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.authCentered}>
@@ -110,6 +114,8 @@ function StartupErrorScreen({ message, onRetry }: { message: string; onRetry: ()
 }
 
 function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) => void }) {
+  const { colors, scheme } = useAppTheme();
+  const styles = useAppStyles();
   const [mode, setMode] = useState<AuthMode>('login');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -261,7 +267,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <StatusBar style="dark" />
+      <StatusBar style={scheme === 'dark' ? 'light' : 'dark'} />
       <KeyboardAvoidingView style={styles.authKeyboard} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView contentContainerStyle={styles.authScroll} keyboardShouldPersistTaps="handled">
           <View style={styles.authShell}>
@@ -300,6 +306,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
                     autoComplete="name"
                     onChangeText={setName}
                     placeholder="Your name"
+                    placeholderTextColor={colors.muted}
                     returnKeyType="next"
                     style={styles.textInput}
                     value={name}
@@ -316,6 +323,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
                     keyboardType="email-address"
                     onChangeText={setEmail}
                     placeholder="you@example.com"
+                    placeholderTextColor={colors.muted}
                     returnKeyType="next"
                     style={styles.textInput}
                     textContentType="emailAddress"
@@ -333,6 +341,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
                     maxLength={8}
                     onChangeText={setCode}
                     placeholder="8-digit code"
+                    placeholderTextColor={colors.muted}
                     style={styles.textInput}
                     textContentType="oneTimeCode"
                     value={code}
@@ -349,6 +358,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
                     onChangeText={setPassword}
                     onSubmitEditing={() => void submit()}
                     placeholder={mode === 'login' ? 'Your password' : '8–128 characters'}
+                    placeholderTextColor={colors.muted}
                     returnKeyType="go"
                     secureTextEntry
                     style={styles.textInput}
@@ -367,7 +377,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
                 style={({ pressed }) => [styles.button, pending && styles.pendingButton, pressed && styles.pressed]}
               >
                 {pending
-                  ? <ActivityIndicator color="#FFF" />
+                  ? <ActivityIndicator color={colors.brandText} />
                   : <Text style={styles.buttonText}>
                     {mode === 'login' ? 'Sign in'
                       : mode === 'signup' ? 'Create account'
@@ -393,7 +403,9 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
                     <AppleAuthentication.AppleAuthenticationButton
                       accessibilityLabel="Sign in with Apple"
                       buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
-                      buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
+                      buttonStyle={scheme === 'dark'
+                        ? AppleAuthentication.AppleAuthenticationButtonStyle.WHITE
+                        : AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
                       cornerRadius={12}
                       onPress={() => {
                         if (!pending) void beginSocialLogin('apple');
@@ -451,6 +463,10 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (account: Account) =
 }
 
 function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => Promise<void> }) {
+  const {
+    colors, scheme, preference, preferenceReady, preferenceSaving, preferenceError, setPreference,
+  } = useAppTheme();
+  const styles = useAppStyles();
   const [tab, setTab] = useState<Tab>('Events');
   const [category, setCategory] = useState<Category>('All');
   const [events, setEvents] = useState<AppEvent[]>([]);
@@ -545,7 +561,7 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <StatusBar style="dark" />
+      <StatusBar style={scheme === 'dark' ? 'light' : 'dark'} />
       <View style={styles.shell}>
         <View style={styles.header}>
           <View style={styles.brand}>
@@ -607,7 +623,7 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
                 <Text accessibilityRole="header" style={styles.sectionTitle}>Upcoming events</Text>
                 <Text style={styles.muted}>{events.length} to look forward to</Text>
               </View>
-              {loadingEvents && <ActivityIndicator color="#234D38" />}
+              {loadingEvents && <ActivityIndicator color={colors.brand} />}
               {!loadingEvents && events.length === 0 && <Text style={styles.muted}>No upcoming events are available right now.</Text>}
               {events.map(event => {
                 const reserved = event.reserved;
@@ -660,6 +676,32 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
 
           {tab === 'Menu' && (
             <>
+              <View style={styles.card}>
+                <Text accessibilityRole="header" style={styles.sectionTitle}>Appearance</Text>
+                <Text style={styles.description}>Choose how Green Fork looks. The system option follows your device setting.</Text>
+                <View style={styles.filters}>
+                  {([
+                    ['system', 'System'],
+                    ['light', 'Light'],
+                    ['dark', 'Dark'],
+                  ] as const).map(([value, label]) => (
+                    <Pressable
+                      key={value}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: preference === value, disabled: !preferenceReady || preferenceSaving }}
+                      disabled={!preferenceReady || preferenceSaving}
+                      onPress={() => void setPreference(value)}
+                      style={[styles.filter, preference === value && styles.activeFilter]}
+                    >
+                      <Text style={[styles.filterText, preference === value && styles.activeFilterText]}>{label}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                {preferenceSaving && <ActivityIndicator color={colors.brand} />}
+                {preferenceError !== '' && (
+                  <Text accessibilityLiveRegion="polite" style={styles.authError}>{preferenceError}</Text>
+                )}
+              </View>
               <View style={styles.filters}>
                 {(['All', 'Food', 'Drinks'] as Category[]).map(item => (
                   <Pressable key={item} accessibilityRole="button" accessibilityState={{ selected: item === category }}
@@ -695,7 +737,7 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
                 <Text style={styles.featureText}>{Math.max(250 - points, 0)} points to a lunch on us</Text>
               </View>
               <Text accessibilityRole="header" style={styles.sectionTitle}>Pick your next perk</Text>
-              {loadingRewards && <ActivityIndicator color="#234D38" />}
+              {loadingRewards && <ActivityIndicator color={colors.brand} />}
               {rewards.map(reward => {
                 const claimed = redeemed.includes(reward.id);
                 const available = points >= reward.pointsCost && !claimed;
@@ -747,7 +789,7 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
             <Text accessibilityRole="header" style={styles.sectionTitle}>Enjoy a little perk?</Text>
             <Text style={styles.description}>Redeem {selectedReward?.name} for {selectedReward?.pointsCost} points? No real voucher is issued in this prototype.</Text>
             <Pressable accessibilityRole="button" disabled={redeeming} onPress={() => void redeemReward()} style={[styles.button, redeeming && styles.pendingButton]}>
-              {redeeming ? <ActivityIndicator color="#FFF" /> : <Text style={styles.buttonText}>Confirm redemption</Text>}
+              {redeeming ? <ActivityIndicator color={colors.brandText} /> : <Text style={styles.buttonText}>Confirm redemption</Text>}
             </Pressable>
             <Pressable accessibilityRole="button" onPress={() => setSelectedReward(null)} style={[styles.button, styles.secondaryButton]}>
               <Text style={styles.secondaryButtonText}>Not right now</Text>
@@ -759,100 +801,100 @@ function MemberApp({ account, onSignOut }: { account: Account; onSignOut: () => 
   );
 }
 
-const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: '#FAF9F5',
-  },
-  authKeyboard: { flex: 1 },
-  authScroll: { flexGrow: 1, justifyContent: 'center', padding: 24 },
-  authShell: { width: '100%', maxWidth: 480, alignSelf: 'center', gap: 16 },
-  authCentered: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24, gap: 16 },
-  authEyebrow: { fontSize: 10, fontWeight: '700', color: '#64725F', letterSpacing: 1.8, marginTop: 20 },
-  authTitle: { fontSize: 34, lineHeight: 40, fontWeight: '700', color: '#233B2B', letterSpacing: -1 },
-  authSubtitle: { color: '#657064', fontSize: 15, lineHeight: 23, textAlign: 'center' },
-  authCard: { backgroundColor: '#FFF', borderRadius: 18, padding: 20, borderWidth: 1, borderColor: '#E5E7DD', gap: 16, marginTop: 8 },
-  socialGroup: { gap: 10 },
-  socialButton: { backgroundColor: '#FFF', borderRadius: 12, borderWidth: 1, borderColor: '#DDE2D6', padding: 14, minHeight: 48, alignItems: 'center', justifyContent: 'center' },
-  socialButtonText: { color: '#233B2B', fontSize: 14, fontWeight: '600' },
-  appleButton: { width: '100%', height: 48 },
-  fieldGroup: { gap: 7 },
-  fieldLabel: { color: '#426046', fontSize: 13, fontWeight: '600' },
-  textInput: { backgroundColor: '#FAF9F5', color: '#233B2B', borderWidth: 1, borderColor: '#DDE2D6', borderRadius: 12, paddingHorizontal: 14, minHeight: 50, fontSize: 15 },
-  authError: { color: '#A12A24', fontSize: 13, lineHeight: 19 },
-  authNotice: { color: '#234D38', fontSize: 13, lineHeight: 19 },
-  authSwitch: { minHeight: 44, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6 },
-  authSwitchText: { color: '#426046', fontSize: 13, fontWeight: '600', textAlign: 'center' },
-  authFootnote: { color: '#657064', fontSize: 11, textAlign: 'center', lineHeight: 18 },
-  pendingButton: { opacity: 0.75 },
-  shell: { flex: 1, width: '100%', maxWidth: 760, alignSelf: 'center' },
-  header: { padding: 20, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 1, borderBottomColor: '#E5E7DD', gap: 12 },
-  brand: { flexDirection: 'row', alignItems: 'center', gap: 10, flexShrink: 1 },
-  logo: { backgroundColor: '#234D38', width: 44, height: 44, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
-  logoText: { fontSize: 30, fontWeight: '700', color: '#FFF', marginTop: -4 },
-  brandName: { color: '#234D38', fontSize: 24, fontWeight: '700', letterSpacing: -1 },
-  brandCaption: { color: '#64725F', fontSize: 8, letterSpacing: 1.4, marginTop: 3 },
-  memberActions: { alignItems: 'flex-end', gap: 6, flexShrink: 1 },
-  memberText: { color: '#234D38', fontSize: 12, fontWeight: '600', maxWidth: 120 },
-  signOutButton: { backgroundColor: '#E9EEDD', paddingHorizontal: 10, paddingVertical: 7, borderRadius: 16 },
-  signOutText: { color: '#234D38', fontSize: 11, fontWeight: '600' },
-  content: { padding: 22, paddingBottom: 30, gap: 16 },
-  eyebrow: { fontSize: 10, fontWeight: '700', color: '#64725F', letterSpacing: 1.8, marginTop: 10 },
-  title: { fontSize: 34, lineHeight: 40, fontWeight: '700', color: '#233B2B', letterSpacing: -1 },
-  subtitle: { color: '#657064', fontSize: 15, lineHeight: 23 },
-  feature: { backgroundColor: '#234D38', borderRadius: 20, padding: 24, marginVertical: 8, gap: 10 },
-  featureIcon: { color: '#DCE9AB', fontSize: 32 },
-  featureTitle: { color: '#FFF', fontSize: 24, fontWeight: '600' },
-  featureText: { color: '#E1E8D9', fontSize: 14, lineHeight: 21 },
-  sectionHeading: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
-  sectionTitle: { color: '#233B2B', fontSize: 20, fontWeight: '700' },
-  muted: { color: '#657064', fontSize: 12 },
-  card: { backgroundColor: '#FFF', borderRadius: 18, padding: 20, borderWidth: 1, borderColor: '#E5E7DD', gap: 12 },
-  eventTop: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  dateBadge: { backgroundColor: '#F0F2E8', borderRadius: 12, padding: 10, minWidth: 56, alignItems: 'center' },
-  dateMonth: { fontSize: 10, color: '#426046', fontWeight: '700', letterSpacing: 1 },
-  dateDay: { fontSize: 26, color: '#234D38', fontWeight: '700' },
-  tag: { color: '#617150', fontSize: 9, fontWeight: '700', letterSpacing: 1, flex: 1 },
-  eventIcon: { fontSize: 36 },
-  cardTitle: { color: '#233B2B', fontSize: 19, fontWeight: '600' },
-  eventTime: { color: '#426046', fontSize: 12, fontWeight: '500' },
-  description: { color: '#657064', fontSize: 14, lineHeight: 22 },
-  button: { backgroundColor: '#234D38', borderRadius: 12, padding: 14, minHeight: 48, alignItems: 'center', justifyContent: 'center' },
-  buttonText: { color: '#FFF', fontSize: 14, fontWeight: '600' },
-  secondaryButton: { backgroundColor: '#EEF2E6' },
-  secondaryButtonText: { color: '#234D38', fontSize: 14, fontWeight: '600' },
-  pressed: { opacity: 0.7 },
-  notice: { backgroundColor: '#E9EEDD', borderRadius: 12, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 8 },
-  noticeText: { color: '#234D38', fontSize: 13, lineHeight: 20, flexShrink: 1 },
-  dismiss: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center', marginLeft: 'auto' },
-  filters: { flexDirection: 'row', gap: 10, marginVertical: 8 },
-  filter: { paddingHorizontal: 22, paddingVertical: 12, minHeight: 44, borderRadius: 24, backgroundColor: '#EEF0E7' },
-  activeFilter: { backgroundColor: '#234D38' },
-  filterText: { color: '#426046', fontWeight: '600', fontSize: 14 },
-  activeFilterText: { color: '#FFF' },
-  menuCard: { flexDirection: 'row', gap: 16, alignItems: 'center', backgroundColor: '#FFF', borderRadius: 18, padding: 16, borderWidth: 1, borderColor: '#E5E7DD' },
-  menuArtwork: { width: 76, height: 90, backgroundColor: '#F0F2E8', borderRadius: 14, justifyContent: 'center', alignItems: 'center' },
-  menuIcon: { fontSize: 42 },
-  menuDetails: { flex: 1, gap: 6 },
-  price: { color: '#234D38', fontSize: 14, fontWeight: '700' },
-  pointsCard: { backgroundColor: '#234D38', borderRadius: 20, padding: 24, gap: 12, marginVertical: 8 },
-  pointsLabel: { fontSize: 10, fontWeight: '700', letterSpacing: 1.8, color: '#DCE9AB' },
-  points: { color: '#FFF', fontSize: 56, fontWeight: '700' },
-  pointsUnit: { color: '#E1E8D9', fontSize: 18, fontWeight: '400' },
-  progressTrack: { backgroundColor: '#52705A', borderRadius: 6, height: 8, overflow: 'hidden', marginTop: 8 },
-  progressFill: { backgroundColor: '#DCE9AB', height: '100%', borderRadius: 6 },
-  rewardHeading: { flexDirection: 'row', gap: 16, alignItems: 'center' },
-  rewardDetails: { flex: 1, gap: 6 },
-  disabledButton: { backgroundColor: '#EEF0E7' },
-  disabledButtonText: { color: '#657064' },
-  howItWorks: { padding: 8, gap: 10 },
-  footnote: { color: '#657064', fontSize: 11, textAlign: 'center', lineHeight: 18, marginTop: 8 },
-  tabBar: { flexDirection: 'row', padding: 10, gap: 8, backgroundColor: '#FFF', borderTopWidth: 1, borderTopColor: '#E5E7DD' },
-  tab: { flex: 1, alignItems: 'center', padding: 10, gap: 4, borderRadius: 14 },
-  activeTab: { backgroundColor: '#EEF2E6' },
-  tabIcon: { color: '#657064', fontSize: 24 },
-  tabText: { color: '#657064', fontSize: 12, fontWeight: '600' },
-  activeTabText: { color: '#234D38' },
-  modalBackdrop: { flex: 1, backgroundColor: '#00000066', alignItems: 'center', justifyContent: 'center', padding: 24 },
-  modalCard: { backgroundColor: '#FFF', borderRadius: 20, padding: 24, gap: 16, width: '100%', maxWidth: 400 },
-});
+function useAppStyles() {
+  const { colors } = useAppTheme();
+  return useMemo(() => StyleSheet.create({
+    safeArea: { flex: 1, backgroundColor: colors.background },
+    authKeyboard: { flex: 1 },
+    authScroll: { flexGrow: 1, justifyContent: 'center', padding: 24 },
+    authShell: { width: '100%', maxWidth: 480, alignSelf: 'center', gap: 16 },
+    authCentered: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24, gap: 16 },
+    authEyebrow: { fontSize: 10, fontWeight: '700', color: colors.muted, letterSpacing: 1.8, marginTop: 20 },
+    authTitle: { fontSize: 34, lineHeight: 40, fontWeight: '700', color: colors.text, letterSpacing: -1 },
+    authSubtitle: { color: colors.muted, fontSize: 15, lineHeight: 23, textAlign: 'center' },
+    authCard: { backgroundColor: colors.surface, borderRadius: 18, padding: 20, borderWidth: 1, borderColor: colors.border, gap: 16, marginTop: 8 },
+    socialGroup: { gap: 10 },
+    socialButton: { backgroundColor: colors.surface, borderRadius: 12, borderWidth: 1, borderColor: colors.border, padding: 14, minHeight: 48, alignItems: 'center', justifyContent: 'center' },
+    socialButtonText: { color: colors.text, fontSize: 14, fontWeight: '600' },
+    appleButton: { width: '100%', height: 48 },
+    fieldGroup: { gap: 7 },
+    fieldLabel: { color: colors.brandAccent, fontSize: 13, fontWeight: '600' },
+    textInput: { backgroundColor: colors.inputBackground, color: colors.text, borderWidth: 1, borderColor: colors.border, borderRadius: 12, paddingHorizontal: 14, minHeight: 50, fontSize: 15 },
+    authError: { color: colors.danger, fontSize: 13, lineHeight: 19 },
+    authNotice: { color: colors.brandAccent, fontSize: 13, lineHeight: 19 },
+    authSwitch: { minHeight: 44, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6 },
+    authSwitchText: { color: colors.brandAccent, fontSize: 13, fontWeight: '600', textAlign: 'center' },
+    authFootnote: { color: colors.muted, fontSize: 11, textAlign: 'center', lineHeight: 18 },
+    pendingButton: { opacity: 0.75 },
+    shell: { flex: 1, width: '100%', maxWidth: 760, alignSelf: 'center' },
+    header: { padding: 20, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 1, borderBottomColor: colors.border, gap: 12 },
+    brand: { flexDirection: 'row', alignItems: 'center', gap: 10, flexShrink: 1 },
+    logo: { backgroundColor: colors.brand, width: 44, height: 44, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
+    logoText: { fontSize: 30, fontWeight: '700', color: colors.brandText, marginTop: -4 },
+    brandName: { color: colors.brandAccent, fontSize: 24, fontWeight: '700', letterSpacing: -1 },
+    brandCaption: { color: colors.muted, fontSize: 8, letterSpacing: 1.4, marginTop: 3 },
+    memberActions: { alignItems: 'flex-end', gap: 6, flexShrink: 1 },
+    memberText: { color: colors.text, fontSize: 12, fontWeight: '600', maxWidth: 120 },
+    signOutButton: { backgroundColor: colors.subtleButton, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 16 },
+    signOutText: { color: colors.subtleButtonText, fontSize: 11, fontWeight: '600' },
+    content: { padding: 22, paddingBottom: 30, gap: 16 },
+    eyebrow: { fontSize: 10, fontWeight: '700', color: colors.muted, letterSpacing: 1.8, marginTop: 10 },
+    title: { fontSize: 34, lineHeight: 40, fontWeight: '700', color: colors.text, letterSpacing: -1 },
+    subtitle: { color: colors.muted, fontSize: 15, lineHeight: 23 },
+    feature: { backgroundColor: colors.brand, borderRadius: 20, padding: 24, marginVertical: 8, gap: 10 },
+    featureIcon: { color: colors.progressFill, fontSize: 32 },
+    featureTitle: { color: colors.brandText, fontSize: 24, fontWeight: '600' },
+    featureText: { color: colors.onBrandMuted, fontSize: 14, lineHeight: 21 },
+    sectionHeading: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+    sectionTitle: { color: colors.text, fontSize: 20, fontWeight: '700' },
+    muted: { color: colors.muted, fontSize: 12 },
+    card: { backgroundColor: colors.surface, borderRadius: 18, padding: 20, borderWidth: 1, borderColor: colors.border, gap: 12 },
+    eventTop: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+    dateBadge: { backgroundColor: colors.surfaceAlt, borderRadius: 12, padding: 10, minWidth: 56, alignItems: 'center' },
+    dateMonth: { fontSize: 10, color: colors.brandAccent, fontWeight: '700', letterSpacing: 1 },
+    dateDay: { fontSize: 26, color: colors.brandAccent, fontWeight: '700' },
+    tag: { color: colors.muted, fontSize: 9, fontWeight: '700', letterSpacing: 1, flex: 1 },
+    eventIcon: { fontSize: 36 },
+    cardTitle: { color: colors.text, fontSize: 19, fontWeight: '600' },
+    eventTime: { color: colors.brandAccent, fontSize: 12, fontWeight: '500' },
+    description: { color: colors.muted, fontSize: 14, lineHeight: 22 },
+    button: { backgroundColor: colors.brand, borderRadius: 12, padding: 14, minHeight: 48, alignItems: 'center', justifyContent: 'center' },
+    buttonText: { color: colors.brandText, fontSize: 14, fontWeight: '600' },
+    secondaryButton: { backgroundColor: colors.brandSoft },
+    secondaryButtonText: { color: colors.brandSoftText, fontSize: 14, fontWeight: '600' },
+    pressed: { opacity: 0.7 },
+    notice: { backgroundColor: colors.brandSoft, borderRadius: 12, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 8 },
+    noticeText: { color: colors.brandSoftText, fontSize: 13, lineHeight: 20, flexShrink: 1 },
+    dismiss: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center', marginLeft: 'auto' },
+    filters: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginVertical: 8 },
+    filter: { paddingHorizontal: 22, paddingVertical: 12, minHeight: 44, borderRadius: 24, backgroundColor: colors.subtleButton },
+    activeFilter: { backgroundColor: colors.brand },
+    filterText: { color: colors.subtleButtonText, fontWeight: '600', fontSize: 14 },
+    activeFilterText: { color: colors.brandText },
+    menuCard: { flexDirection: 'row', gap: 16, alignItems: 'center', backgroundColor: colors.surface, borderRadius: 18, padding: 16, borderWidth: 1, borderColor: colors.border },
+    menuArtwork: { width: 76, height: 90, backgroundColor: colors.surfaceAlt, borderRadius: 14, justifyContent: 'center', alignItems: 'center' },
+    menuIcon: { fontSize: 42 },
+    menuDetails: { flex: 1, gap: 6 },
+    price: { color: colors.brandAccent, fontSize: 14, fontWeight: '700' },
+    pointsCard: { backgroundColor: colors.brand, borderRadius: 20, padding: 24, gap: 12, marginVertical: 8 },
+    pointsLabel: { fontSize: 10, fontWeight: '700', letterSpacing: 1.8, color: colors.onBrandMuted },
+    points: { color: colors.brandText, fontSize: 56, fontWeight: '700' },
+    pointsUnit: { color: colors.onBrandMuted, fontSize: 18, fontWeight: '400' },
+    progressTrack: { backgroundColor: colors.progressTrack, borderRadius: 6, height: 8, overflow: 'hidden', marginTop: 8 },
+    progressFill: { backgroundColor: colors.progressFill, height: '100%', borderRadius: 6 },
+    rewardHeading: { flexDirection: 'row', gap: 16, alignItems: 'center' },
+    rewardDetails: { flex: 1, gap: 6 },
+    disabledButton: { backgroundColor: colors.disabledBackground },
+    disabledButtonText: { color: colors.disabledText },
+    howItWorks: { padding: 8, gap: 10 },
+    footnote: { color: colors.muted, fontSize: 11, textAlign: 'center', lineHeight: 18, marginTop: 8 },
+    tabBar: { flexDirection: 'row', padding: 10, gap: 8, backgroundColor: colors.surface, borderTopWidth: 1, borderTopColor: colors.border },
+    tab: { flex: 1, alignItems: 'center', padding: 10, gap: 4, borderRadius: 14 },
+    activeTab: { backgroundColor: colors.brandSoft },
+    tabIcon: { color: colors.muted, fontSize: 24 },
+    tabText: { color: colors.muted, fontSize: 12, fontWeight: '600' },
+    activeTabText: { color: colors.brandAccent },
+    modalBackdrop: { flex: 1, backgroundColor: colors.overlay, alignItems: 'center', justifyContent: 'center', padding: 24 },
+    modalCard: { backgroundColor: colors.surface, borderRadius: 20, padding: 24, gap: 16, width: '100%', maxWidth: 400 },
+  }), [colors]);
+}
